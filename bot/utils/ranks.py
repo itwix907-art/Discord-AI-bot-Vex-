@@ -16,17 +16,19 @@ ranks.py
 """
 
 import os
-import json
+import copy
+import logging
 import secrets
 import string
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from bot.utils.data_manager import load_settings, _atomic_write, _lock, now_ts
+from bot.utils.data_manager import load_settings, _atomic_write, _read_json, _lock, now_ts
 
 STAFF_FILE = Path(__file__).resolve().parent.parent / "data" / "staff.json"
 LOGS_FILE = Path(__file__).resolve().parent.parent / "data" / "logs.json"
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # تعريف الرتب والصلاحيات الافتراضية
@@ -100,22 +102,20 @@ DEFAULT_STAFF = {"codes": {}, "staff": {}, "usage": {}}
 
 
 def _read_staff() -> Dict[str, Any]:
-    if not STAFF_FILE.exists():
-        _atomic_write(STAFF_FILE, DEFAULT_STAFF)
-        return DEFAULT_STAFF.copy()
-    try:
-        with open(STAFF_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        data = DEFAULT_STAFF.copy()
-        _atomic_write(STAFF_FILE, data)
-    for key, value in DEFAULT_STAFF.items():
-        data.setdefault(key, value.copy() if isinstance(value, dict) else value)
-    return data
+    with _lock:
+        data = _read_json(STAFF_FILE, DEFAULT_STAFF)
+        for key in DEFAULT_STAFF:
+            if not isinstance(data.get(key), dict):
+                logger.warning("Invalid %s section in staff data; using an empty mapping", key)
+                data[key] = {}
+        return data
 
 
 def _write_staff(data: Dict[str, Any]) -> None:
-    _atomic_write(STAFF_FILE, data)
+    if not isinstance(data, dict):
+        raise TypeError("staff data must be a dictionary")
+    with _lock:
+        _atomic_write(STAFF_FILE, data)
 
 
 def get_owner_id() -> Optional[int]:
@@ -186,18 +186,33 @@ def get_daily_limit(user_id: int) -> int:
 
 def get_today_usage(user_id: int) -> int:
     """كم أضاف هذا العضو اليوم (للتحقق من الحد اليومي)."""
-    staff = _read_staff()
-    today = time.strftime("%Y-%m-%d")
-    entry = staff.get("usage", {}).get(str(user_id), {})
-    if entry.get("date") != today:
-        return 0
-    return int(entry.get("added", 0))
+    with _lock:
+        staff = _read_staff()
+        today = time.strftime("%Y-%m-%d")
+        entry = staff.get("usage", {}).get(str(user_id), {})
+        if not isinstance(entry, dict) or entry.get("date") != today:
+            return 0
+        try:
+            return max(0, int(entry.get("added", 0)))
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Invalid daily usage value for principal %s", user_id)
+            return 0
 
 
 def record_usage(user_id: int, amount: int) -> None:
     """يسجل المبلغ المضاف اليوم (لأجل الحد اليومي)."""
-    if amount <= 0:
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
         return
+    adjust_daily_usage(user_id, amount)
+
+
+def reserve_daily_quota(user_id: int, amount: int, limit: int) -> bool:
+    """Reserve daily addition quota atomically; zero limit means unlimited."""
+    if (
+        not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0
+        or not isinstance(limit, int) or isinstance(limit, bool) or limit < 0
+    ):
+        return False
     with _lock:
         staff = _read_staff()
         today = time.strftime("%Y-%m-%d")
@@ -205,7 +220,34 @@ def record_usage(user_id: int, amount: int) -> None:
         entry = usage.get(str(user_id), {})
         if entry.get("date") != today:
             entry = {"date": today, "added": 0}
-        entry["added"] = int(entry.get("added", 0)) + amount
+        try:
+            current = max(0, int(entry.get("added", 0)))
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Invalid daily quota entry for principal %s", user_id)
+            current = 0
+        if limit and current + amount > limit:
+            return False
+        entry["added"] = current + amount
+        usage[str(user_id)] = entry
+        _write_staff(staff)
+        return True
+
+
+def adjust_daily_usage(user_id: int, amount: int) -> None:
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount == 0:
+        return
+    with _lock:
+        staff = _read_staff()
+        today = time.strftime("%Y-%m-%d")
+        usage = staff.setdefault("usage", {})
+        entry = usage.get(str(user_id), {})
+        if not isinstance(entry, dict) or entry.get("date") != today:
+            entry = {"date": today, "added": 0}
+        try:
+            current = max(0, int(entry.get("added", 0)))
+        except (TypeError, ValueError, OverflowError):
+            current = 0
+        entry["added"] = max(0, current + amount)
         usage[str(user_id)] = entry
         _write_staff(staff)
 
@@ -248,11 +290,13 @@ def generate_code(rank: str, created_by: int, note: str = "") -> Optional[str]:
 
 
 def list_codes() -> Dict[str, Any]:
-    return _read_staff()["codes"]
+    with _lock:
+        return copy.deepcopy(_read_staff()["codes"])
 
 
 def list_staff() -> Dict[str, Any]:
-    return _read_staff()["staff"]
+    with _lock:
+        return copy.deepcopy(_read_staff()["staff"])
 
 
 def revoke_code(code: str) -> bool:
@@ -294,7 +338,7 @@ def activate_code(code: str, user_id: int) -> Dict[str, Any]:
         if current:
             current_level = RANK_LEVELS.get(current.get("rank"), 0)
             new_level = RANK_LEVELS.get(entry["rank"], 0)
-            if current_level >= new_level and current.get("code") and current.get("code") != code:
+            if current_level >= new_level and current.get("rank") in RANK_LEVELS and current.get("code") != code:
                 return {
                     "ok": False,
                     "message": f"عندك رتبة **{RANK_NAMES_AR.get(current['rank'])}** بالفعل وما تقدر تاخذ رتبة أقل بنفس الحساب.",
@@ -347,14 +391,12 @@ def remove_staff(user_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def load_logs() -> List[Dict[str, Any]]:
-    if not LOGS_FILE.exists():
-        _atomic_write(LOGS_FILE, [])
-        return []
-    try:
-        with open(LOGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
+    with _lock:
+        data = _read_json(LOGS_FILE, [])
+        valid_logs = [entry for entry in data if isinstance(entry, dict)]
+        if len(valid_logs) != len(data):
+            logger.warning("Discarding invalid entries from the staff audit log")
+        return copy.deepcopy(valid_logs[-300:])
 
 
 def log_action(actor_id: int, actor_name: str, action: str, details: str, source: str = "discord") -> None:
@@ -364,10 +406,10 @@ def log_action(actor_id: int, actor_name: str, action: str, details: str, source
         logs.append({
             "ts": now_ts(),
             "actor_id": str(actor_id),
-            "actor_name": actor_name,
-            "action": action,
-            "details": details,
-            "source": source,
+            "actor_name": str(actor_name)[:100],
+            "action": str(action)[:100],
+            "details": str(details)[:1000],
+            "source": str(source)[:30],
         })
         logs = logs[-300:]
         _atomic_write(LOGS_FILE, logs)

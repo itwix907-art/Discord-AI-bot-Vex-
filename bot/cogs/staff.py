@@ -14,13 +14,17 @@ staff.py
 الآيدي الثابت للمالك يُقرأ من ملف .env (OWNER_ID) ويمتلك كل الصلاحيات تلقائيًا.
 """
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from bot.utils import ranks
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
-from bot.utils.data_manager import get_user, add_wallet, add_bank, load_settings
+from bot.utils.data_manager import atomic_update_user, load_settings
+
+logger = logging.getLogger(__name__)
 
 
 class Staff(commands.Cog):
@@ -99,6 +103,11 @@ class Staff(commands.Cog):
     ])
     @ranks.rank_check("manage_codes")
     async def gencode(self, ctx: commands.Context, rank: app_commands.Choice[str], count: int = 1, note: str = ""):
+        actor_rank = ranks.get_rank(ctx.author.id) or ""
+        actor_level = 4 if actor_rank == "owner" else ranks.RANK_LEVELS.get(actor_rank, 0)
+        if actor_rank != "owner" and ranks.RANK_LEVELS.get(rank.value, 0) >= actor_level:
+            await ctx.send(embed=error_embed("Hierarchy", "ما تقدر تولد كود لرتبة مساوية أو أعلى من رتبتك."))
+            return
         count = max(1, min(count, 5))
         codes = []
         for _ in range(count):
@@ -144,6 +153,13 @@ class Staff(commands.Cog):
     @ranks.rank_check("manage_codes")
     async def revokecode(self, ctx: commands.Context, code: str):
         code = code.strip().upper()
+        entry = ranks.list_codes().get(code)
+        actor_rank = ranks.get_rank(ctx.author.id) or ""
+        actor_level = 4 if actor_rank == "owner" else ranks.RANK_LEVELS.get(actor_rank, 0)
+        target_level = ranks.RANK_LEVELS.get(entry.get("rank", ""), 0) if isinstance(entry, dict) else 0
+        if entry and actor_rank != "owner" and target_level >= actor_level:
+            await ctx.send(embed=error_embed("Hierarchy", "ما تقدر تسحب كود لرتبة مساوية أو أعلى من رتبتك."))
+            return
         if ranks.revoke_code(code):
             await ctx.send(embed=success_embed("تم السحب", f"الكود `{code}` تم سحبه ولن يعمل بعد الآن."))
             ranks.log_action(ctx.author.id, str(ctx.author), "revoke_code", f"سحب {code}", "discord")
@@ -239,29 +255,61 @@ class Staff(commands.Cog):
             await ctx.send(embed=error_embed("خطأ", "المبلغ لازم يكون أكبر من صفر."))
             return
 
-        remaining = ranks.remaining_daily_quota(ctx.author.id)
-        if remaining is not None and amount > remaining:
+        limit = ranks.get_daily_limit(ctx.author.id)
+        if not ranks.reserve_daily_quota(ctx.author.id, amount, limit):
+            remaining = ranks.remaining_daily_quota(ctx.author.id)
             await ctx.send(embed=error_embed(
                 "تجاوزت حدك اليومي",
-                f"المتبقي لك اليوم: {currency(remaining)} فقط.\nاطلب ترقية رتبتك من الإدارة."
+                f"المتبقي لك اليوم: {currency(remaining or 0)} فقط.\nاطلب ترقية رتبتك من الإدارة."
             ))
             return
 
-        settings = load_settings()["economy"]
-        get_user(member.id, settings["starting_balance"])
-        if to_bank:
-            new_balance = add_bank(member.id, amount, settings["max_bank"])
-        else:
-            new_balance = add_wallet(member.id, amount, settings["max_wallet"])
-        ranks.record_usage(ctx.author.id, amount)
+        settings = load_settings().get("economy", {})
+        outcome = {}
+
+        def add_funds(user):
+            key = "bank" if to_bank else "wallet"
+            cap_key = "max_bank" if to_bank else "max_wallet"
+            try:
+                balance = max(0, int(user.get(key, 0)))
+                cap = int(settings[cap_key])
+                earned = max(0, int(user.get("total_earned", 0)))
+                if cap < 0:
+                    raise ValueError("invalid balance cap")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            credited = min(amount, max(0, cap - balance))
+            if credited <= 0:
+                outcome["full"] = True
+                return False
+            user[key] = balance + credited
+            if not to_bank:
+                user["total_earned"] = earned + credited
+            outcome.update({"balance": balance + credited, "credited": credited})
+            return True
+
+        try:
+            atomic_update_user(member.id, add_funds, int(settings["starting_balance"]))
+        except (OSError, TypeError, ValueError, OverflowError):
+            ranks.adjust_daily_usage(ctx.author.id, -amount)
+            logger.exception("Staff money addition failed actor=%s target=%s", ctx.author.id, member.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ الإضافة المالية. حاول لاحقًا."))
+            return
+        if outcome.get("invalid") or outcome.get("full"):
+            ranks.adjust_daily_usage(ctx.author.id, -amount)
+            await ctx.send(embed=error_embed("تجاوزت الحد", "رصيد العضو وصل إلى الحد الأقصى."))
+            return
+        if outcome["credited"] < amount:
+            ranks.adjust_daily_usage(ctx.author.id, outcome["credited"] - amount)
 
         target_txt = "لنفسك" if member.id == ctx.author.id else f"لـ {member.mention}"
         await ctx.send(embed=success_embed(
             "تمت الإضافة",
-            f"أضفت {currency(amount)} {target_txt}\nالرصيد الجديد: {currency(new_balance)}"
+            f"أضفت {currency(outcome['credited'])} {target_txt}\nالرصيد الجديد: {currency(outcome['balance'])}"
         ))
         ranks.log_action(ctx.author.id, str(ctx.author), "add_money",
-                         f"أضاف {amount} لـ {member} ({'بنك' if to_bank else 'محفظة'})", "discord")
+                         f"أضاف {outcome['credited']} لـ {member} ({'بنك' if to_bank else 'محفظة'})", "discord")
 
     # ------------------------------------------------------------ سحب فلوس (برتبة الإدارة)
     @commands.hybrid_command(name="removemoney", description="سحب فلوس من عضو (إدارة/رتبة)")
@@ -271,17 +319,35 @@ class Staff(commands.Cog):
         if amount <= 0:
             await ctx.send(embed=error_embed("خطأ", "المبلغ لازم يكون أكبر من صفر."))
             return
-        settings = load_settings()["economy"]
-        get_user(member.id, settings["starting_balance"])
-        if from_bank:
-            new_balance = add_bank(member.id, -amount, settings["max_bank"])
-        else:
-            new_balance = add_wallet(member.id, -amount, settings["max_wallet"])
+        settings = load_settings().get("economy", {})
+        outcome = {}
+
+        def remove_funds(user):
+            key = "bank" if from_bank else "wallet"
+            try:
+                balance = max(0, int(user.get(key, 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            removed = min(amount, balance)
+            user[key] = balance - removed
+            outcome.update({"balance": balance - removed, "removed": removed})
+            return True
+
+        try:
+            atomic_update_user(member.id, remove_funds, int(settings["starting_balance"]))
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Staff money removal failed actor=%s target=%s", ctx.author.id, member.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ السحب المالي. حاول لاحقًا."))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "رصيد العضو غير صالح."))
+            return
         await ctx.send(embed=success_embed(
             "تم السحب",
-            f"سحبت {currency(amount)} من {member.mention}\nرصيده الجديد: {currency(new_balance)}"
+            f"سحبت {currency(outcome['removed'])} من {member.mention}\nرصيده الجديد: {currency(outcome['balance'])}"
         ))
-        ranks.log_action(ctx.author.id, str(ctx.author), "remove_money", f"سحب {amount} من {member}", "discord")
+        ranks.log_action(ctx.author.id, str(ctx.author), "remove_money", f"سحب {outcome['removed']} من {member}", "discord")
 
     # ------------------------------------------------------------ تصفير (برتبة الإدارة)
     @commands.hybrid_command(name="resetbalance", description="تصفير رصيد عضو (إدارة/رتبة)")

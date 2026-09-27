@@ -11,15 +11,17 @@ career.py
 الوظائف والأرقام كلها من لوحة التحكم: settings.career
 """
 
-import time
 import random
+import logging
+import math
 
-import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.utils.data_manager import get_user, update_user, load_settings, now_ts
+from bot.utils.data_manager import atomic_update_user, get_user, update_user, load_settings, now_ts
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 def fmt_left(seconds: int) -> str:
@@ -141,42 +143,94 @@ class Career(commands.Cog):
             return
 
         now = now_ts()
-        cooldown = int(cfg.get("work_cooldown_minutes", 45)) * 60
-        elapsed = now - user.get("last_job_work", 0)
-        if elapsed < cooldown:
-            await ctx.send(embed=error_embed("لسا بدري!", f"شغلتك القادمة بعد **{fmt_left(cooldown - elapsed)}**."))
+        try:
+            cooldown = int(cfg.get("work_cooldown_minutes", 45)) * 60
+            salary_range = job.get("salary", [50, 100])
+            if (
+                cooldown < 0 or not isinstance(salary_range, list) or len(salary_range) != 2
+                or int(salary_range[0]) < 0 or int(salary_range[0]) > int(salary_range[1])
+            ):
+                raise ValueError("invalid career work settings")
+            salary_min, salary_max = int(salary_range[0]), int(salary_range[1])
+            max_wallet = int(settings["max_wallet"])
+            starting_balance = int(settings["starting_balance"])
+            seniority_bonus = int(cfg.get("salary_seniority_bonus", 10))
+            promote_after = max(1, int(cfg.get("promote_after", 10)))
+            if min(max_wallet, seniority_bonus) < 0:
+                raise ValueError("invalid career wallet settings")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid career work settings for user %s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "إعدادات العمل غير صالحة."))
             return
 
-        seniority = int(user.get("job_seniority", 1))
-        bonus_pct = int(cfg.get("salary_seniority_bonus", 10)) * (seniority - 1)
-        salary = random.randint(*job.get("salary", [50, 100]))
-        salary = int(salary * (1 + bonus_pct / 100))
+        outcome = {}
 
-        works = int(user.get("job_works", 0)) + 1
-        total_works = int(user.get("total_works", 0)) + 1
+        def claim_salary(current):
+            try:
+                last_work = int(current.get("last_job_work", 0))
+                wallet = max(0, int(current.get("wallet", 0)))
+                total_earned = max(0, int(current.get("total_earned", 0)))
+                seniority = max(1, int(current.get("job_seniority", 1)))
+                works = max(0, int(current.get("job_works", 0))) + 1
+                total_works = max(0, int(current.get("total_works", 0))) + 1
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if last_work < 0 or last_work > now:
+                last_work = 0
+            elapsed = now - last_work
+            if elapsed < cooldown:
+                outcome["remaining"] = cooldown - elapsed
+                return False
+            if current.get("job", "") != job_id:
+                outcome["job_changed"] = True
+                return False
+            bonus_pct = seniority_bonus * (seniority - 1)
+            salary = int(random.randint(salary_min, salary_max) * (1 + bonus_pct / 100))
+            salary = min(salary, max(0, max_wallet - wallet))
+            if salary <= 0:
+                outcome["full"] = True
+                return False
+            current.update({
+                "wallet": wallet + salary,
+                "total_earned": total_earned + salary,
+                "last_job_work": now,
+                "job_works": works,
+                "total_works": total_works,
+            })
+            outcome.update({"salary": salary, "bonus_pct": bonus_pct, "works": works})
+            return True
 
-        update_user(ctx.author.id, {
-            "wallet": user["wallet"] + salary,
-            "total_earned": user.get("total_earned", 0) + salary,
-            "last_job_work": now,
-            "job_works": works,
-            "total_works": total_works
-        })
+        try:
+            atomic_update_user(ctx.author.id, claim_salary, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Career salary failed for user %s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ راتبك. حاول لاحقًا."))
+            return
+        if "remaining" in outcome:
+            await ctx.send(embed=error_embed("لسا بدري!", f"شغلتك القادمة بعد **{fmt_left(outcome['remaining'])}**."))
+            return
+        if outcome.get("job_changed"):
+            await ctx.send(embed=error_embed("الوظيفة تغيّرت", "تحقق من وضعك الوظيفي قبل العمل مجددًا."))
+            return
+        if outcome.get("invalid") or outcome.get("full"):
+            await ctx.send(embed=error_embed("خطأ", "تعذر إضافة الراتب إلى محفظتك."))
+            return
 
-        promote_after = int(cfg.get("promote_after", 10))
-        ready = works >= promote_after
+        ready = outcome["works"] >= promote_after
         embed = success_embed(
             f"{job.get('emoji', '💼')} يومية زينة!",
-            f"اشتغلت كـ **{job['name']}** وكسبت {currency(salary)}"
-            + (f" (بونص أقدمية +{bonus_pct}%)" if bonus_pct else "")
+            f"اشتغلت كـ **{job['name']}** وكسبت {currency(outcome['salary'])}"
+            + (f" (بونص أقدمية +{outcome['bonus_pct']}%)" if outcome["bonus_pct"] else "")
         )
-        progress = min(works, promote_after)
+        progress = min(outcome["works"], promote_after)
         embed.add_field(
             name="📈 نحو الترقية",
             value=f"`{'█' * progress}{'░' * (promote_after - progress)}` {progress}/{promote_after}"
                   + ("\n✨ جاهز للترقية! استخدم `career promote`" if ready else ""),
             inline=False
         )
+        logger.info("career_work user=%s amount=%s", ctx.author.id, outcome["salary"])
         await ctx.send(embed=embed)
 
     # ------------------------------------------------------------- الترقية
@@ -316,23 +370,61 @@ class Career(commands.Cog):
     async def career_business(self, ctx: commands.Context, action: app_commands.Choice[str]):
         cfg = load_settings().get("career", {})
         biz_cfg = cfg.get("business", {})
-        settings = load_settings()["economy"]
-        user = get_user(ctx.author.id, settings["starting_balance"])
-        biz = user.get("business")
+        settings = load_settings().get("economy", {})
         now = now_ts()
+        try:
+            starting_balance = int(settings["starting_balance"])
+            max_wallet = int(settings["max_wallet"])
+            if max_wallet < 0:
+                raise ValueError("invalid wallet limit")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid business economy settings user=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "إعدادات البزنس غير صالحة."))
+            return
+
+        outcome = {}
 
         if action.value == "start":
-            if biz:
-                await ctx.send(embed=error_embed("عندك بزنس!", f"بزنسك مستواه {biz.get('level', 1)} — طوره بدل ما تفتح ثاني."))
+            try:
+                cost = int(biz_cfg.get("start_cost", 10000))
+                if cost < 0:
+                    raise ValueError("invalid business start cost")
+            except (TypeError, ValueError, OverflowError):
+                await ctx.send(embed=error_embed("خطأ", "تكلفة البزنس غير صالحة."))
                 return
-            cost = int(biz_cfg.get("start_cost", 10000))
-            if user["wallet"] < cost:
-                await ctx.send(embed=error_embed("رصيد غير كافي", f"تفتح بزنس بـ {currency(cost)} ومحفظتك فيها {currency(user['wallet'])}."))
+
+            def start_business(user):
+                try:
+                    wallet = max(0, int(user.get("wallet", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    outcome["invalid"] = True
+                    return False
+                biz = user.get("business")
+                if biz:
+                    outcome["exists"] = int(biz.get("level", 1)) if isinstance(biz, dict) else 1
+                    return False
+                if wallet < cost:
+                    outcome["insufficient"] = wallet
+                    return False
+                user.update({"wallet": wallet - cost, "business": {"level": 1, "last_collect": 0}})
+                return True
+
+            try:
+                atomic_update_user(ctx.author.id, start_business, starting_balance)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Business purchase failed user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ عملية فتح البزنس."))
                 return
-            update_user(ctx.author.id, {
-                "wallet": user["wallet"] - cost,
-                "business": {"level": 1, "last_collect": 0}
-            })
+            if "exists" in outcome:
+                await ctx.send(embed=error_embed("عندك بزنس!", f"بزنسك مستواه {outcome['exists']} — طوره بدل ما تفتح ثاني."))
+                return
+            if "insufficient" in outcome:
+                await ctx.send(embed=error_embed("رصيد غير كافي", f"تفتح بزنس بـ {currency(cost)} ومحفظتك فيها {currency(outcome['insufficient'])}."))
+                return
+            if outcome.get("invalid"):
+                await ctx.send(embed=error_embed("خطأ", "رصيد محفظتك غير صالح."))
+                return
+            logger.info("business_start user=%s amount=%s", ctx.author.id, cost)
             await ctx.send(embed=success_embed(
                 "🚀 مشروع جديد!",
                 f"فتحت بزنسك الخاص بـ {currency(cost)}!\n"
@@ -340,47 +432,135 @@ class Career(commands.Cog):
             ))
 
         elif action.value == "collect":
-            if not biz:
+            try:
+                daily_min = int(biz_cfg.get("daily_min", 100))
+                daily_max = int(biz_cfg.get("daily_max", 400))
+                if daily_min < 0 or daily_min > daily_max:
+                    raise ValueError("invalid business profit settings")
+            except (TypeError, ValueError, OverflowError):
+                await ctx.send(embed=error_embed("خطأ", "إعدادات أرباح البزنس غير صالحة."))
+                return
+
+            def collect_profit(user):
+                try:
+                    biz = user.get("business")
+                    if not isinstance(biz, dict):
+                        outcome["missing"] = True
+                        return False
+                    level = max(1, int(biz.get("level", 1)))
+                    last_collect = int(biz.get("last_collect", 0))
+                    wallet = max(0, int(user.get("wallet", 0)))
+                    earned = max(0, int(user.get("total_earned", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    outcome["invalid"] = True
+                    return False
+                if last_collect < 0 or last_collect > now:
+                    last_collect = 0
+                elapsed = now - last_collect
+                if elapsed < 86400:
+                    outcome["remaining"] = 86400 - elapsed
+                    return False
+                profit = random.randint(daily_min, daily_max) * level
+                actual = min(profit, max(0, max_wallet - wallet))
+                if actual <= 0:
+                    outcome["full"] = True
+                    return False
+                user.update({
+                    "wallet": wallet + actual,
+                    "total_earned": earned + actual,
+                    "business": {"level": level, "last_collect": now},
+                })
+                outcome.update({"profit": actual, "level": level})
+                return True
+
+            try:
+                atomic_update_user(ctx.author.id, collect_profit, starting_balance)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Business collection failed user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ أرباح البزنس."))
+                return
+            if outcome.get("missing"):
                 await ctx.send(embed=error_embed("ما عندك بزنس", "ابدأ مشروعك أول بأمر `career business start`."))
                 return
-            elapsed = now - int(biz.get("last_collect", 0))
-            if elapsed < 86400:
-                await ctx.send(embed=error_embed("لسا بدري!", f"أرباح اليوم تتحصل بعد **{fmt_left(86400 - elapsed)}**."))
+            if "remaining" in outcome:
+                await ctx.send(embed=error_embed("لسا بدري!", f"أرباح اليوم تتحصل بعد **{fmt_left(outcome['remaining'])}**."))
                 return
-            level = int(biz.get("level", 1))
-            profit = random.randint(int(biz_cfg.get("daily_min", 100)), int(biz_cfg.get("daily_max", 400))) * level
-            update_user(ctx.author.id, {
-                "wallet": user["wallet"] + profit,
-                "total_earned": user.get("total_earned", 0) + profit,
-                "business": {"level": level, "last_collect": now}
-            })
+            if outcome.get("invalid") or outcome.get("full"):
+                await ctx.send(embed=error_embed("خطأ", "تعذر إضافة أرباح البزنس إلى محفظتك."))
+                return
+            logger.info("business_collect user=%s amount=%s", ctx.author.id, outcome["profit"])
             await ctx.send(embed=success_embed(
                 "💵 أرباح البزنس",
-                f"حصلت على {currency(profit)} من بزنسك (مستوى {level})."
+                f"حصلت على {currency(outcome['profit'])} من بزنسك (مستوى {outcome['level']})."
             ))
 
         elif action.value == "upgrade":
-            if not biz:
+            try:
+                base_cost = int(biz_cfg.get("upgrade_cost", 5000))
+                mult = float(biz_cfg.get("upgrade_multiplier", 1.3))
+                max_level = int(biz_cfg.get("max_level", 10))
+                if base_cost < 0 or not math.isfinite(mult) or mult <= 0 or max_level < 1:
+                    raise ValueError("invalid business upgrade settings")
+            except (TypeError, ValueError, OverflowError):
+                await ctx.send(embed=error_embed("خطأ", "إعدادات تطوير البزنس غير صالحة."))
+                return
+
+            def upgrade_business(user):
+                try:
+                    biz = user.get("business")
+                    if not isinstance(biz, dict):
+                        outcome["missing"] = True
+                        return False
+                    level = max(1, int(biz.get("level", 1)))
+                    wallet = max(0, int(user.get("wallet", 0)))
+                    last_collect = max(0, int(biz.get("last_collect", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    outcome["invalid"] = True
+                    return False
+                if level >= max_level:
+                    outcome["max_level"] = level
+                    return False
+                try:
+                    cost = int(base_cost * (mult ** (level - 1)))
+                except OverflowError:
+                    outcome["invalid"] = True
+                    return False
+                if cost < 0 or cost > max_wallet:
+                    outcome["invalid"] = True
+                    return False
+                if wallet < cost:
+                    outcome.update({"insufficient": wallet, "cost": cost, "level": level})
+                    return False
+                user.update({
+                    "wallet": wallet - cost,
+                    "business": {"level": level + 1, "last_collect": last_collect},
+                })
+                outcome.update({"level": level + 1, "cost": cost})
+                return True
+
+            try:
+                atomic_update_user(ctx.author.id, upgrade_business, starting_balance)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Business upgrade failed user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ تطوير البزنس."))
+                return
+            if outcome.get("missing"):
                 await ctx.send(embed=error_embed("ما عندك بزنس", "ابدأ مشروعك أول بأمر `career business start`."))
                 return
-            level = int(biz.get("level", 1))
-            max_level = int(biz_cfg.get("max_level", 10))
-            if level >= max_level:
+            if "max_level" in outcome:
                 await ctx.send(embed=error_embed("أقصى مستوى", f"بزنسك وصل أقصى مستوى ({max_level}). مبروك يا رجل أعمال! 👔"))
                 return
-            mult = float(biz_cfg.get("upgrade_multiplier", 1.3))
-            cost = int(biz_cfg.get("upgrade_cost", 5000) * (mult ** (level - 1)))
-            if user["wallet"] < cost:
-                await ctx.send(embed=error_embed("رصيد غير كافي", f"التطوير يكلف {currency(cost)} ومحفظتك فيها {currency(user['wallet'])}."))
+            if "insufficient" in outcome:
+                await ctx.send(embed=error_embed("رصيد غير كافي", f"التطوير يكلف {currency(int(base_cost * (mult ** (outcome['level'] - 1))))} ومحفظتك فيها {currency(outcome['insufficient'])}."))
                 return
-            update_user(ctx.author.id, {
-                "wallet": user["wallet"] - cost,
-                "business": {"level": level + 1, "last_collect": biz.get("last_collect", 0)}
-            })
+            if outcome.get("invalid"):
+                await ctx.send(embed=error_embed("خطأ", "بيانات البزنس أو تكلفة التطوير غير صالحة."))
+                return
+            logger.info("business_upgrade user=%s level=%s amount=%s", ctx.author.id, outcome["level"], outcome["cost"])
             await ctx.send(embed=success_embed(
                 "📈 تم التطوير!",
-                f"بزنسك صار **مستوى {level + 1}** — أرباحك اليومية زادت!\n"
-                f"التطوير القادم يكلف حوالي {currency(int(biz_cfg.get('upgrade_cost', 5000) * (mult ** level)))}."
+                f"بزنسك صار **مستوى {outcome['level']}** — أرباحك اليومية زادت!\n"
+                f"التطوير القادم يكلف حوالي {currency(int(base_cost * (mult ** outcome['level'])))}."
             ))
 
 

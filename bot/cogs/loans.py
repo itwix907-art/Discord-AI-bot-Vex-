@@ -11,16 +11,19 @@ loans.py
 كل شيء محفوظ في bot/data/loans.json.
 """
 
-import time
+import logging
+import asyncio
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot.utils.data_manager import (
-    get_user, update_user, load_settings, load_loans, save_loans, now_ts
+    atomic_update_loans, atomic_update_users, get_user, load_settings, load_loans, now_ts
 )
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 def fmt_left(seconds: int) -> str:
@@ -45,13 +48,28 @@ def has_overdue(loans_data: dict, user_id: int) -> bool:
 def refresh_overdue(loans_data: dict) -> None:
     """يعلم أي قرض نشط فات موعده كـ متأخر."""
     now = now_ts()
-    changed = False
-    for loan in loans_data["loans"]:
-        if loan["status"] == "active" and loan["due"] < now:
-            loan["status"] = "overdue"
-            changed = True
-    if changed:
-        save_loans(loans_data)
+
+    def mark_overdue(data):
+        changed = False
+        for loan in data["loans"]:
+            if not isinstance(loan, dict):
+                continue
+            try:
+                due = int(loan.get("due", 0))
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Invalid due timestamp in loan record")
+                continue
+            if loan.get("status") == "active" and due > 0 and due < now:
+                loan["status"] = "overdue"
+                changed = True
+        return changed
+
+    try:
+        current = atomic_update_loans(mark_overdue)
+        loans_data.clear()
+        loans_data.update(current)
+    except (OSError, TypeError, ValueError):
+        logger.exception("Could not refresh overdue loan state")
 
 
 class LoanView(discord.ui.View):
@@ -88,6 +106,7 @@ class LoanView(discord.ui.View):
 class Loans(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.transaction_lock = asyncio.Lock()
         self.overdue_check.start()
 
     def cog_unload(self):
@@ -118,61 +137,108 @@ class Loans(commands.Cog):
     @loan.command(name="request", description="طلب قرض من عضو آخر")
     @app_commands.describe(lender="العضو اللي تطلب منه القرض", amount="مبلغ القرض", days="مدة السداد بالأيام (افتراضي 3)")
     async def loan_request(self, ctx: commands.Context, lender: discord.Member, amount: int, days: int = 3):
-        cfg = load_settings().get("loans", {})
+        settings = load_settings()
+        cfg = settings.get("loans", {})
         if not cfg.get("enabled", True):
             await ctx.send(embed=error_embed("معطل", "نظام القروض معطل من الإدارة."))
             return
         if lender.bot or lender.id == ctx.author.id:
             await ctx.send(embed=error_embed("خطأ", "اختر عضو صحيح غيرك."))
             return
-        if amount < int(cfg.get("min_amount", 100)):
-            await ctx.send(embed=error_embed("خطأ", f"أقل مبلغ قرض هو {currency(cfg.get('min_amount', 100))}."))
+        try:
+            economy = settings.get("economy", {})
+            starting_balance = int(economy["starting_balance"])
+            minimum = int(cfg.get("min_amount", 100))
+            maximum = int(cfg.get("max_amount", 50000))
+            max_duration = int(cfg.get("max_duration_days", 7))
+            max_active = int(cfg.get("max_active", 2))
+            interest_pct = int(cfg.get("default_interest", 10))
+            if (
+                minimum < 1 or maximum < minimum or not 1 <= max_duration <= 3650
+                or max_active < 0 or not 0 <= interest_pct <= 1000
+            ):
+                raise ValueError("invalid loan configuration")
+            amount = int(amount)
+            days = max(1, min(int(days), max_duration))
+            if amount <= 0:
+                raise ValueError("invalid loan amount")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid loan request settings borrower=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "إعدادات القرض أو المبلغ غير صالحة."))
             return
-        if amount > int(cfg.get("max_amount", 50000)):
-            await ctx.send(embed=error_embed("خطأ", f"أقصى مبلغ قرض هو {currency(cfg.get('max_amount', 50000))}."))
+        if amount < minimum:
+            await ctx.send(embed=error_embed("خطأ", f"أقل مبلغ قرض هو {currency(minimum)}."))
             return
-        days = max(1, min(days, int(cfg.get("max_duration_days", 7))))
-
-        loans_data = load_loans()
-        refresh_overdue(loans_data)
-
-        # منع المدين المتأخر من طلب قروض جديدة
-        if has_overdue(loans_data, ctx.author.id):
-            await ctx.send(embed=error_embed("عندك قرض متأخر!", "سدد قروضك المتأخرة أول قبل ما تطلب قرض جديد."))
+        if amount > maximum:
+            await ctx.send(embed=error_embed("خطأ", f"أقصى مبلغ قرض هو {currency(maximum)}."))
             return
 
-        # حد عدد القروض النشطة
-        active = [l for l in loans_data["loans"]
-                  if l["borrower"] == str(ctx.author.id) and l["status"] in ("active", "overdue")]
-        if len(active) >= int(cfg.get("max_active", 2)):
-            await ctx.send(embed=error_embed("وصلت الحد", f"لازم تسدد قرض من قروضك الحالية ({len(active)})."))
-            return
-
-        # المُقرض لازم يكون محفظته تغطي المبلغ
-        lender_user = get_user(lender.id, 100)
+        lender_user = get_user(lender.id, starting_balance)
         if lender_user["wallet"] < amount:
             await ctx.send(embed=error_embed("ما يكفيه", f"محفظة {lender.display_name} ما تغطي هذا المبلغ."))
             return
 
-        interest_pct = int(cfg.get("default_interest", 10))
         total = int(amount * (1 + interest_pct / 100))
+        outcome = {}
 
-        loan_id = loans_data["next_id"]
-        loans_data["next_id"] += 1
-        loan = {
-            "id": loan_id,
-            "lender": str(lender.id),
-            "borrower": str(ctx.author.id),
-            "principal": amount,
-            "interest_pct": interest_pct,
-            "total": total,
-            "paid": 0,
-            "status": "pending",
-            "created": now_ts(),
-            "due": now_ts() + days * 86400,
-        }
-        loans_data["loans"].append(loan)
-        save_loans(loans_data)
+        def create_request(data):
+            now = now_ts()
+            active = []
+            for current in data["loans"]:
+                if not isinstance(current, dict) or current.get("borrower") != str(ctx.author.id):
+                    continue
+                if current.get("status") == "active":
+                    try:
+                        due = int(current.get("due", 0))
+                    except (TypeError, ValueError, OverflowError):
+                        outcome["invalid"] = True
+                        return False
+                    if due > 0 and due < now:
+                        current["status"] = "overdue"
+                if current.get("status") in ("active", "overdue", "pending"):
+                    active.append(current)
+            if any(loan.get("status") == "overdue" for loan in active):
+                outcome["overdue"] = True
+                return False
+            if len(active) >= max_active:
+                outcome["active"] = len(active)
+                return False
+
+            loan_id = data["next_id"]
+            data["next_id"] += 1
+            loan = {
+                "id": loan_id,
+                "lender": str(lender.id),
+                "borrower": str(ctx.author.id),
+                "principal": amount,
+                "interest_pct": interest_pct,
+                "total": total,
+                "paid": 0,
+                "status": "pending",
+                "created": now,
+                "due": now + days * 86400,
+            }
+            data["loans"].append(loan)
+            outcome["loan"] = loan
+            return True
+
+        try:
+            atomic_update_loans(create_request)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Loan request persistence failed borrower=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ طلب القرض."))
+            return
+        if outcome.get("overdue"):
+            await ctx.send(embed=error_embed("عندك قرض متأخر!", "سدد قروضك المتأخرة أول قبل ما تطلب قرض جديد."))
+            return
+        if "active" in outcome:
+            await ctx.send(embed=error_embed("وصلت الحد", f"لازم تسدد قرض من قروضك الحالية ({outcome['active']})."))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات قروضك الحالية غير صالحة."))
+            return
+        loan_id = outcome["loan"]["id"]
+        logger.info("loan_request borrower=%s lender=%s loan=%s amount=%s", ctx.author.id, lender.id, loan_id, amount)
 
         embed = base_embed(f"💳 طلب قرض #{loan_id}")
         embed.description = (
@@ -188,30 +254,86 @@ class Loans(commands.Cog):
 
     # ------------------------------------------------------------- تمويل القرض (عند الموافقة)
     async def fund_loan(self, message: discord.Message, interaction: discord.Interaction, loan_id: int):
-        loans_data = load_loans()
-        loan = next((l for l in loans_data["loans"] if l["id"] == loan_id), None)
-        if not loan or loan["status"] != "pending":
-            await interaction.followup.send(embed=error_embed("انتهى الطلب", "هذا الطلب تم التعامل معه بالفعل."))
-            return
+        async with self.transaction_lock:
+            loans_data = load_loans()
+            loans = loans_data.get("loans", [])
+            if not isinstance(loans, list):
+                await interaction.followup.send(embed=error_embed("خطأ", "بيانات القروض غير صالحة."))
+                return
+            loan = next((item for item in loans if isinstance(item, dict) and item.get("id") == loan_id), None)
+            if not loan or loan.get("status") != "pending":
+                await interaction.followup.send(embed=error_embed("انتهى الطلب", "هذا الطلب تم التعامل معه بالفعل."))
+                return
 
-        settings = load_settings()["economy"]
-        lender_id = int(loan["lender"])
-        borrower_id = int(loan["borrower"])
+            settings = load_settings().get("economy", {})
+            try:
+                lender_id = int(loan["lender"])
+                borrower_id = int(loan["borrower"])
+                principal = int(loan["principal"])
+                starting_balance = int(settings["starting_balance"])
+                max_wallet = int(settings["max_wallet"])
+                if lender_id == borrower_id or principal <= 0 or max_wallet < 0:
+                    raise ValueError("invalid loan settlement")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                logger.exception("Invalid pending loan data id=%s", loan_id)
+                await interaction.followup.send(embed=error_embed("خطأ", "بيانات القرض غير صالحة."))
+                return
 
-        lender_user = get_user(lender_id, settings["starting_balance"])
-        if lender_user["wallet"] < loan["principal"]:
-            loan["status"] = "declined"
-            save_loans(loans_data)
-            await interaction.followup.send(embed=error_embed("فشل التحويل", "محفظة المُقرض ما تغطي المبلغ بعد الآن."))
-            return
+            outcome = {}
 
-        # نقل الفلوس: المُقرض → المقترض فورًا
-        update_user(lender_id, {"wallet": lender_user["wallet"] - loan["principal"]})
-        borrower_user = get_user(borrower_id, settings["starting_balance"])
-        update_user(borrower_id, {"wallet": borrower_user["wallet"] + loan["principal"]})
+            def fund(accounts):
+                try:
+                    lender_wallet = max(0, int(accounts[str(lender_id)].get("wallet", 0)))
+                    borrower_wallet = max(0, int(accounts[str(borrower_id)].get("wallet", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    outcome["invalid"] = True
+                    return False
+                if lender_wallet < principal:
+                    outcome["insufficient"] = True
+                    return False
+                if borrower_wallet + principal > max_wallet:
+                    outcome["limit"] = True
+                    return False
+                accounts[str(lender_id)]["wallet"] = lender_wallet - principal
+                accounts[str(borrower_id)]["wallet"] = borrower_wallet + principal
+                return True
 
-        loan["status"] = "active"
-        save_loans(loans_data)
+            try:
+                atomic_update_users([lender_id, borrower_id], fund, starting_balance)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Loan funding failed id=%s", loan_id)
+                await interaction.followup.send(embed=error_embed("خطأ", "تعذر حفظ تحويل القرض. حاول لاحقًا."))
+                return
+            if outcome.get("insufficient"):
+                loan["status"] = "declined"
+                try:
+                    save_loans(loans_data)
+                except (OSError, TypeError, ValueError):
+                    logger.exception("Could not close unfunded loan id=%s", loan_id)
+                await interaction.followup.send(embed=error_embed("فشل التحويل", "محفظة المُقرض ما تغطي المبلغ بعد الآن."))
+                return
+            if outcome.get("limit") or outcome.get("invalid"):
+                await interaction.followup.send(embed=error_embed("تجاوزت الحد", "لا يمكن إضافة مبلغ القرض إلى محفظة المقترض."))
+                return
+
+            loan["status"] = "active"
+            try:
+                save_loans(loans_data)
+            except (OSError, TypeError, ValueError):
+                logger.exception("Could not persist funded loan id=%s; rolling back balances", loan_id)
+
+                def rollback(accounts):
+                    accounts[str(lender_id)]["wallet"] = int(accounts[str(lender_id)].get("wallet", 0)) + principal
+                    accounts[str(borrower_id)]["wallet"] = max(
+                        0, int(accounts[str(borrower_id)].get("wallet", 0)) - principal
+                    )
+
+                try:
+                    atomic_update_users([lender_id, borrower_id], rollback, starting_balance)
+                except (OSError, TypeError, ValueError, OverflowError):
+                    logger.exception("Loan funding rollback failed id=%s", loan_id)
+                await interaction.followup.send(embed=error_embed("خطأ", "تعذر حفظ القرض؛ لم يكتمل التحويل."))
+                return
 
         lender = self.bot.get_user(lender_id)
         borrower = self.bot.get_user(borrower_id)
@@ -253,38 +375,117 @@ class Loans(commands.Cog):
         await self._repay_amount(ctx, loans_data, [loan], loan["total"] - loan["paid"])
 
     async def _repay_amount(self, ctx, loans_data, loans, amount: int):
-        settings = load_settings()["economy"]
-        user = get_user(ctx.author.id, settings["starting_balance"])
-        if user["wallet"] < amount:
-            await ctx.send(embed=error_embed(
-                "رصيد غير كافي",
-                f"تحتاج {currency(amount)} بمحفظتك للسداد، وعندك {currency(user['wallet'])}."
-            ))
-            return
+        async with self.transaction_lock:
+            try:
+                loan_ids = {int(loan["id"]) for loan in loans if isinstance(loan, dict)}
+            except (KeyError, TypeError, ValueError, OverflowError):
+                logger.exception("Invalid selected loan records user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "بيانات القروض غير صالحة."))
+                return
+            loans_data = load_loans()
+            current_loans = loans_data.get("loans", [])
+            if not isinstance(current_loans, list):
+                await ctx.send(embed=error_embed("خطأ", "بيانات القروض غير صالحة."))
+                return
+            loans = [
+                loan for loan in current_loans
+                if isinstance(loan, dict)
+                and loan.get("id") in loan_ids
+                and loan.get("borrower") == str(ctx.author.id)
+                and loan.get("status") in ("active", "overdue")
+            ]
+            if not loans:
+                await ctx.send(embed=error_embed("ما عندك قروض", "تم سداد هذه القروض بالفعل."))
+                return
+            settings = load_settings().get("economy", {})
+            try:
+                starting_balance = int(settings["starting_balance"])
+                max_wallet = int(settings["max_wallet"])
+                if amount <= 0 or max_wallet < 0:
+                    raise ValueError("invalid repayment amount")
+                payments = []
+                remaining = amount
+                for loan in loans:
+                    if remaining <= 0:
+                        break
+                    due_now = int(loan["total"]) - int(loan["paid"])
+                    lender_id = int(loan["lender"])
+                    pay = min(due_now, remaining)
+                    if due_now <= 0 or pay <= 0:
+                        continue
+                    payments.append((loan, lender_id, pay))
+                    remaining -= pay
+                if remaining:
+                    raise ValueError("repayment exceeds selected debt")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                logger.exception("Invalid repayment data user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "بيانات السداد غير صالحة."))
+                return
 
-        update_user(ctx.author.id, {"wallet": user["wallet"] - amount})
+            user_ids = list({ctx.author.id, *(lender_id for _, lender_id, _ in payments)})
+            outcome = {}
 
-        # توزيع المبلغ على القروض
-        remaining = amount
-        for loan in loans:
-            if remaining <= 0:
-                break
-            due_now = loan["total"] - loan["paid"]
-            pay = min(due_now, remaining)
-            loan["paid"] += pay
-            remaining -= pay
-            if loan["paid"] >= loan["total"]:
-                loan["status"] = "paid"
-                lender_id = int(loan["lender"])
-                lender_user = get_user(lender_id, settings["starting_balance"])
-                update_user(lender_id, {"wallet": lender_user["wallet"] + pay})
-            else:
-                # سداد جزئي يروح للمُقرض أيضًا
-                lender_id = int(loan["lender"])
-                lender_user = get_user(lender_id, settings["starting_balance"])
-                update_user(lender_id, {"wallet": lender_user["wallet"] + pay})
+            def repay(accounts):
+                try:
+                    borrower_wallet = max(0, int(accounts[str(ctx.author.id)].get("wallet", 0)))
+                    lender_wallets = {
+                        lender_id: max(0, int(accounts[str(lender_id)].get("wallet", 0)))
+                        for _, lender_id, _ in payments
+                    }
+                except (TypeError, ValueError, OverflowError):
+                    outcome["invalid"] = True
+                    return False
+                if borrower_wallet < amount:
+                    outcome["insufficient"] = borrower_wallet
+                    return False
+                for lender_id, wallet in lender_wallets.items():
+                    addition = sum(pay for _, target_id, pay in payments if target_id == lender_id)
+                    if wallet + addition > max_wallet:
+                        outcome["limit"] = True
+                        return False
+                accounts[str(ctx.author.id)]["wallet"] = borrower_wallet - amount
+                for _, lender_id, pay in payments:
+                    accounts[str(lender_id)]["wallet"] += pay
+                return True
 
-        save_loans(loans_data)
+            try:
+                atomic_update_users(user_ids, repay, starting_balance)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Loan repayment transfer failed user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ السداد. حاول لاحقًا."))
+                return
+            if outcome.get("insufficient") is not None:
+                await ctx.send(embed=error_embed(
+                    "رصيد غير كافي",
+                    f"تحتاج {currency(amount)} بمحفظتك للسداد، وعندك {currency(outcome['insufficient'])}."
+                ))
+                return
+            if outcome.get("limit") or outcome.get("invalid"):
+                await ctx.send(embed=error_embed("تجاوزت الحد", "لا يمكن إضافة قيمة السداد إلى محفظة المُقرض."))
+                return
+
+            try:
+                for loan, _, pay in payments:
+                    loan["paid"] = int(loan["paid"]) + pay
+                    if loan["paid"] >= int(loan["total"]):
+                        loan["status"] = "paid"
+                save_loans(loans_data)
+            except (OSError, TypeError, ValueError, OverflowError):
+                logger.exception("Could not persist repayment state user=%s", ctx.author.id)
+                def rollback(accounts):
+                    accounts[str(ctx.author.id)]["wallet"] = int(accounts[str(ctx.author.id)].get("wallet", 0)) + amount
+                    for _, lender_id, pay in payments:
+                        accounts[str(lender_id)]["wallet"] = max(
+                            0, int(accounts[str(lender_id)].get("wallet", 0)) - pay
+                        )
+                try:
+                    atomic_update_users(user_ids, rollback, starting_balance)
+                except (OSError, TypeError, ValueError, OverflowError):
+                    logger.exception("Loan repayment rollback failed user=%s", ctx.author.id)
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ حالة السداد؛ لم تكتمل العملية."))
+                return
+
+        logger.info("loan_repay user=%s amount=%s loans=%s", ctx.author.id, amount, len(payments))
         await ctx.send(embed=success_embed("تم السداد", f"سددت {currency(amount)} بنجاح. الله يعافيك! 💰"))
 
     # ------------------------------------------------------------- قروضي

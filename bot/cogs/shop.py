@@ -5,12 +5,16 @@ shop.py
 المنتجات تُدار بالكامل من لوحة التحكم عن طريق settings.json -> shop.items
 """
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.utils.data_manager import get_user, add_wallet, update_user, load_settings
+from bot.utils.data_manager import atomic_update_user, get_user, load_settings
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 class Shop(commands.Cog):
@@ -39,40 +43,91 @@ class Shop(commands.Cog):
     @app_commands.describe(item_id="آيدي المنتج من المتجر")
     async def buy(self, ctx: commands.Context, item_id: str):
         settings = load_settings()
-        e = settings["economy"]
+        e = settings.get("economy", {})
         items = settings.get("shop", {}).get("items", [])
+        if not isinstance(items, list):
+            await ctx.send(embed=error_embed("خطأ", "قائمة المتجر غير صالحة."))
+            return
 
-        item = next((i for i in items if i["id"] == item_id), None)
+        item = next((entry for entry in items if isinstance(entry, dict) and entry.get("id") == item_id), None)
         if not item:
             await ctx.send(embed=error_embed("غير موجود", "ما فيه منتج بهذا الآيدي. شوف `shop` للقائمة الكاملة."))
             return
 
-        user = get_user(ctx.author.id, e["starting_balance"])
-        if user["wallet"] < item["price"]:
-            await ctx.send(embed=error_embed("رصيد غير كافي", f"تحتاج {currency(item['price'])} لشراء هذا المنتج."))
+        price = item.get("price")
+        try:
+            max_wallet = int(e["max_wallet"])
+            starting_balance = int(e["starting_balance"])
+            if not isinstance(price, int) or isinstance(price, bool) or price < 0 or price > max_wallet:
+                raise ValueError("invalid product price")
+            if not isinstance(item_id, str) or not item_id or len(item_id) > 100:
+                raise ValueError("invalid product id")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.warning("Invalid shop item configuration for item %r", item_id)
+            await ctx.send(embed=error_embed("خطأ", "سعر المنتج أو إعداداته غير صالحة."))
             return
 
-        # لو المنتج رتبة، أعطها للعضو مباشرة
-        if item.get("type") == "role" and item.get("role_id"):
+        role = None
+        role_added = False
+        if item.get("type") == "role":
             try:
-                role = ctx.guild.get_role(int(item["role_id"]))
-                if role:
+                role_id = int(item.get("role_id"))
+                role = ctx.guild.get_role(role_id)
+                bot_member = ctx.guild.me
+                if role is None or bot_member is None or role.managed or role >= bot_member.top_role:
+                    raise ValueError("shop role is missing or above the bot")
+                if role not in ctx.author.roles:
                     await ctx.author.add_roles(role, reason="شراء من المتجر")
-            except (discord.Forbidden, discord.HTTPException, ValueError):
+                    role_added = True
+            except (discord.Forbidden, discord.HTTPException, TypeError, ValueError, AttributeError):
                 await ctx.send(embed=error_embed(
                     "خطأ بالصلاحيات",
                     "ما قدرت أعطيك الرتبة. تأكد إن رتبة البوت أعلى من الرتبة المطلوبة."
                 ))
                 return
 
-        add_wallet(ctx.author.id, -item["price"], e["max_wallet"])
-        inventory = user.get("inventory", [])
-        inventory.append(item["id"])
-        update_user(ctx.author.id, {"inventory": inventory})
+        result = {}
 
+        def purchase(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+            except (TypeError, ValueError, OverflowError):
+                result["invalid"] = True
+                return False
+            inventory = user.get("inventory", [])
+            if not isinstance(inventory, list) or len(inventory) >= 1000:
+                result["invalid"] = True
+                return False
+            if wallet < price:
+                result["insufficient"] = True
+                return False
+            user.update({"wallet": wallet - price, "inventory": inventory + [item_id]})
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, purchase, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Shop purchase failed user=%s item=%s", ctx.author.id, item_id)
+            result["failed"] = True
+
+        if result:
+            if role_added and role is not None:
+                try:
+                    await ctx.author.remove_roles(role, reason="إلغاء عملية شراء لم تُحفظ")
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception("Could not roll back shop role user=%s role=%s", ctx.author.id, role.id)
+            if result.get("insufficient"):
+                await ctx.send(embed=error_embed("رصيد غير كافي", f"تحتاج {currency(price)} لشراء هذا المنتج."))
+            elif result.get("invalid"):
+                await ctx.send(embed=error_embed("خطأ", "تعذر إكمال الشراء بسبب بيانات غير صالحة."))
+            else:
+                await ctx.send(embed=error_embed("خطأ", "تعذر حفظ عملية الشراء. حاول لاحقًا."))
+            return
+
+        logger.info("shop_purchase user=%s item=%s amount=%s", ctx.author.id, item_id, price)
         await ctx.send(embed=success_embed(
             "تم الشراء! 🎉",
-            f"اشتريت **{item['name']}** مقابل {currency(item['price'])}"
+            f"اشتريت **{item.get('name', item_id)}** مقابل {currency(price)}"
         ))
 
     @commands.hybrid_command(name="inventory", aliases=["inv", "مخزون"], description="عرض مخزونك من المنتجات")

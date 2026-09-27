@@ -21,7 +21,6 @@ import time
 import secrets
 import logging
 import inspect
-import json
 import hashlib
 import math
 import types
@@ -35,10 +34,11 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.utils.data_manager import (
-    load_users, update_user, load_settings, save_settings,
-    get_user, load_market, load_loans, save_loans, get_economy_stats, now_ts
+    atomic_update_user, load_users, load_settings, save_settings,
+    load_market, load_loans, save_loans, get_economy_stats, now_ts
 )
 from bot.utils import ranks
+from bot.cogs.atria import atria_chat
 
 logger = logging.getLogger("Vixen.Web")
 
@@ -47,6 +47,8 @@ DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent / "dashboard"
 SESSION_TTL = 7 * 24 * 3600  # أسبوع
 MAX_ATTEMPTS = 8
 ATTEMPT_WINDOW = 300  # 5 دقائق
+MAX_SESSIONS = 5000
+MAX_ATTEMPT_IPS = 10000
 
 
 class DashboardSessions:
@@ -58,16 +60,28 @@ class DashboardSessions:
 
     def _prune_attempts(self, ip):
         now = time.time()
-        self.attempts[ip] = [t for t in self.attempts.get(ip, []) if now - t < ATTEMPT_WINDOW]
+        attempts = [t for t in self.attempts.get(ip, []) if now - t < ATTEMPT_WINDOW]
+        if attempts:
+            self.attempts[ip] = attempts
+        else:
+            self.attempts.pop(ip, None)
 
     def too_many_attempts(self, ip) -> bool:
         self._prune_attempts(ip)
         return len(self.attempts.get(ip, [])) >= MAX_ATTEMPTS
 
     def record_attempt(self, ip):
+        if ip not in self.attempts and len(self.attempts) >= MAX_ATTEMPT_IPS:
+            self.attempts.pop(next(iter(self.attempts)))
         self.attempts.setdefault(ip, []).append(time.time())
 
     def create(self, user_id, rank: str, name: str = "", virtual: bool = False, code: str = "") -> str:
+        now = time.time()
+        expired = [token for token, value in self.sessions.items() if value.get("expires", 0) <= now]
+        for expired_token in expired:
+            self.sessions.pop(expired_token, None)
+        while len(self.sessions) >= MAX_SESSIONS:
+            self.sessions.pop(next(iter(self.sessions)))
         token = secrets.token_hex(32)
         self.sessions[token] = {
             "user_id": str(user_id) if user_id else "0",
@@ -75,7 +89,7 @@ class DashboardSessions:
             "name": name,
             "virtual": virtual,   # جلسة بكود غير مربوط بآيدي ديسكورد
             "code": code,
-            "expires": time.time() + SESSION_TTL,
+            "expires": now + SESSION_TTL,
         }
         return token
 
@@ -183,6 +197,8 @@ async def api_login(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
 
     method = body.get("method", "code")
     settings = load_settings()
@@ -197,16 +213,29 @@ async def api_login(request: web.Request) -> web.Response:
             SESSIONS.record_attempt(ip)
             return _error("هذا الكود تم سحبه", 403)
 
-        rank = entry["rank"]
+        rank = entry.get("rank")
+        if rank not in ranks.RANK_LEVELS:
+            return _error("بيانات كود غير صالحة", 403)
         used_by = entry.get("used_by")
         if used_by:
-            # كود مربوط بآيدي: يدخل بصلاحيات صاحبه
-            user_id = int(used_by)
-            token = SESSIONS.create(user_id, rank, name=resolve_name(None, user_id))
-            perms = ranks.get_permissions(user_id)
-            limit = ranks.get_daily_limit(user_id)
+            try:
+                user_id = int(used_by)
+            except (TypeError, ValueError, OverflowError):
+                return _error("بيانات كود غير صالحة", 403)
+            if user_id < 0:
+                token = SESSIONS.create(0, rank, name=f"كود …{code[-4:]}", virtual=True, code=code)
+                perms = ranks.DEFAULT_PERMISSIONS.get(rank, [])
+                limit = ranks.DEFAULT_DAILY_LIMITS.get(rank, 0)
+            else:
+                token = SESSIONS.create(user_id, rank, name=resolve_name(None, user_id))
+                perms = ranks.get_permissions(user_id)
+                limit = ranks.get_daily_limit(user_id)
         else:
-            # كود جديد غير مستخدم: جلسة افتراضية برتبة الكود
+            # اربط الكود بهوية Dashboard غير سالبة الهوية البشرية قبل إنشاء الجلسة.
+            principal_id = -(secrets.randbelow((1 << 62) - 1) + 1)
+            activation = ranks.activate_code(code, principal_id)
+            if not activation.get("ok"):
+                return _error(activation.get("message", "تعذر تفعيل الكود."), 409)
             token = SESSIONS.create(0, rank, name=f"كود …{code[-4:]}", virtual=True, code=code)
             perms = ranks.DEFAULT_PERMISSIONS.get(rank, [])
             limit = ranks.DEFAULT_DAILY_LIMITS.get(rank, 0)
@@ -567,6 +596,8 @@ async def api_command_execute(request: web.Request) -> web.Response:
         body=await request.json()
     except Exception:
         return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
     path=str(body.get("command") or "").strip().lstrip("/").replace("/", ".").replace(" ", ".")
     if not path: return _error("command مطلوب")
     bot=request.app.get("bot"); guild=bot.guilds[0] if bot and bot.guilds else None
@@ -630,51 +661,63 @@ async def api_command_execute(request: web.Request) -> web.Response:
             logger.exception("Could not persist dashboard audit log for /%s", path)
         logger.info("Dashboard command executed: /%s by %s", path, actor_name)
         return _json_response({"ok":True,"message":message})
-    except (discord.Forbidden,discord.HTTPException) as e:
+    except (discord.Forbidden,discord.HTTPException):
         logger.warning(
-            "Dashboard command rejected by Discord: /%s by %s: %s",
+            "Dashboard command rejected by Discord: /%s by %s",
             path,
             getattr(author, "name", session.get("name", "unknown")),
-            e,
         )
-        return _error(f"Discord رفض العملية: {e}",403)
-    except commands.CheckFailure as e:
+        return _error("Discord رفض تنفيذ العملية.",403)
+    except commands.CheckFailure:
         logger.warning(
-            "Dashboard command denied: /%s by %s: %s",
+            "Dashboard command denied: /%s by %s",
             path,
             getattr(author, "name", session.get("name", "unknown")),
-            e,
         )
-        return _error(str(e) or "ما عندك صلاحية لهذا الأمر", 403)
-    except (TypeError, ValueError) as e:
-        return _error(str(e) or "المعاملات غير صالحة", 400)
-    except Exception as e:
-        logger.exception("command execution failed")
-        return _error(str(e),400)
+        return _error("ما عندك صلاحية لهذا الأمر.", 403)
+    except (TypeError, ValueError):
+        return _error("المعاملات غير صالحة.", 400)
+    except Exception:
+        logger.exception("Dashboard command execution failed: /%s", path)
+        return _error("تعذر تنفيذ الأمر. راجع سجل البوت للتفاصيل.", 500)
 
 
 async def api_atria(request: web.Request) -> web.Response:
     require_permission(request, "view_stats")
-    body=await request.json(); prompt=str(body.get("prompt") or "").strip(); mode=str(body.get("mode") or "chat").lower()
-    if not prompt: return _error("prompt مطلوب")
-    key=os.getenv("ATRIA_API_KEY")
-    if not key: return _error("ATRIA_API_KEY غير مضبوط على السيرفر",503)
-    import aiohttp
-    system="You are Vixen Discord EDR assistant. Help with Discord administration, moderation, security and bot operations. Be concise and safe." if mode != "moderation" else "You are a Discord safety moderator. Analyze the supplied text and return JSON only with action: allow, warn, timeout, or ban, plus a short reason. Do not invent facts."
-    payload={"model":"Atria-Dawn-Preview","messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"max_tokens":1400}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
-            async with s.post("https://api.atria-asi.ai/v1/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload) as r:
-                data=await r.json(content_type=None)
-                if r.status>=400: return _error(str(data.get("error",{}).get("message",f"Atria HTTP {r.status}")),r.status)
-                return _json_response({"ok":True,"answer":data["choices"][0]["message"]["content"]})
-    except Exception as e: return _error(f"Atria: {e}",502)
+        body = await request.json()
+    except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
+    prompt = body.get("prompt")
+    mode = body.get("mode", "chat")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
+        return _error("اكتب نصاً صالحاً لا يتجاوز 4000 حرف.")
+    if mode not in {"chat", "moderation"}:
+        return _error("وضع Atria غير صالح.")
+    system = (
+        "You are Vixen Discord EDR assistant. Help with Discord administration, moderation, security and bot operations. Be concise and safe."
+        if mode == "chat" else
+        "You are a Discord safety moderator. Analyze the supplied text and return JSON only with action: allow, warn, timeout, or ban, plus a short reason. Do not invent facts."
+    )
+    try:
+        answer = await atria_chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            1400,
+        )
+        return _json_response({"ok": True, "answer": answer[:4000]})
+    except (RuntimeError, ValueError):
+        logger.exception("Dashboard Atria request failed")
+        return _error("تعذر الوصول إلى خدمة Atria الآن.", 502)
 
 async def api_money(request: web.Request) -> web.Response:
     session = require_permission(request, "")  # الصلاحية تتحدد حسب العملية تحت
     try:
         body = await request.json()
     except Exception:
+        return _error("طلب غير صالح")
+    if not isinstance(body, dict):
         return _error("طلب غير صالح")
 
     virtual = session.get("virtual", False)
@@ -687,11 +730,21 @@ async def api_money(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         return _error("المبلغ لازم يكون رقمًا")
 
-    if not user_id.isdigit():
+    if isinstance(body.get("amount", 0), bool) or not user_id.isdigit() or int(user_id) <= 0:
         return _error("آيدي العضو غير صالح")
+    if mode not in {"wallet", "bank"}:
+        return _error("نوع الرصيد غير صالح")
 
-    settings = load_settings()["economy"]
-    target = get_user(int(user_id), settings["starting_balance"])
+    settings = load_settings().get("economy", {})
+    try:
+        starting_balance = int(settings["starting_balance"])
+        max_wallet = int(settings["max_wallet"])
+        max_bank = int(settings["max_bank"])
+        if min(max_wallet, max_bank) < 0:
+            raise ValueError("invalid balance caps")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        logger.exception("Invalid Dashboard economy settings")
+        return _error("إعدادات الاقتصاد غير صالحة.", 503)
 
     bot = request.app.get("bot")
     if virtual:
@@ -707,25 +760,51 @@ async def api_money(request: web.Request) -> web.Response:
         if virtual:
             usage_key = f"code_{session.get('code', '؟')}"
             limit = ranks.DEFAULT_DAILY_LIMITS.get(session["rank"], 0)
-            remaining = None if limit == 0 else max(0, limit - ranks.get_today_usage(usage_key))
         else:
-            remaining = ranks.remaining_daily_quota(actor_id)
-        if remaining is not None and amount > remaining:
-            return _error(f"تجاوزت حدك اليومي — المتبقي لك: {remaining}", 403)
+            limit = ranks.get_daily_limit(actor_id)
+            usage_key = actor_id
+        if not ranks.reserve_daily_quota(usage_key, amount, limit):
+            remaining = ranks.remaining_daily_quota(usage_key)
+            return _error(f"تجاوزت حدك اليومي — المتبقي لك: {remaining or 0}", 403)
 
-        updates = {}
-        if mode == "bank":
-            updates["bank"] = min(settings["max_bank"], target.get("bank", 0) + amount)
-        else:
-            updates["wallet"] = min(settings["max_wallet"], target.get("wallet", 0) + amount)
-            updates["total_earned"] = target.get("total_earned", 0) + amount
-        new_data = update_user(int(user_id), updates)
-        if virtual:
-            ranks.record_usage(usage_key, amount)
-        else:
-            ranks.record_usage(actor_id, amount)
-        ranks.log_action(actor_id, actor_name, "add_money",
-                         f"أضاف {amount} لـ {user_id} ({'بنك' if mode == 'bank' else 'محفظة'})", "dashboard")
+        outcome = {}
+        balance_key = "bank" if mode == "bank" else "wallet"
+        cap = max_bank if mode == "bank" else max_wallet
+
+        def add_money(user):
+            try:
+                balance = max(0, int(user.get(balance_key, 0)))
+                earned = max(0, int(user.get("total_earned", 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            credited = min(amount, max(0, cap - balance))
+            if credited <= 0:
+                outcome["full"] = True
+                return False
+            user[balance_key] = balance + credited
+            if balance_key == "wallet":
+                user["total_earned"] = earned + credited
+            outcome.update({"credited": credited, "balance": balance + credited})
+            return True
+
+        try:
+            new_data = atomic_update_user(int(user_id), add_money, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            ranks.adjust_daily_usage(usage_key, -amount)
+            logger.exception("Dashboard money addition failed actor=%s target=%s", actor_id, user_id)
+            return _error("تعذر حفظ الإضافة المالية. حاول لاحقًا.", 500)
+        if outcome.get("full") or outcome.get("invalid"):
+            ranks.adjust_daily_usage(usage_key, -amount)
+            return _error("رصيد العضو وصل إلى الحد الأقصى أو أن بياناته غير صالحة.")
+        if outcome["credited"] < amount:
+            ranks.adjust_daily_usage(usage_key, outcome["credited"] - amount)
+        try:
+            ranks.log_action(actor_id, actor_name, "add_money",
+                             f"أضاف {outcome['credited']} لـ {user_id} ({'بنك' if mode == 'bank' else 'محفظة'})", "dashboard")
+        except (OSError, TypeError, ValueError):
+            logger.exception("Could not write Dashboard money audit log")
+        logger.info("dashboard_add_money actor=%s target=%s amount=%s", actor_id, user_id, outcome["credited"])
         return _json_response({"ok": True, "wallet": new_data["wallet"], "bank": new_data["bank"]})
 
     elif action == "remove":
@@ -733,20 +812,45 @@ async def api_money(request: web.Request) -> web.Response:
             return _error("ما عندك صلاحية سحب فلوس", 403)
         if amount <= 0:
             return _error("المبلغ لازم يكون أكبر من صفر")
-        updates = {}
-        if mode == "bank":
-            updates["bank"] = max(0, target.get("bank", 0) - amount)
-        else:
-            updates["wallet"] = max(0, target.get("wallet", 0) - amount)
-        new_data = update_user(int(user_id), updates)
-        ranks.log_action(actor_id, actor_name, "remove_money",
-                         f"سحب {amount} من {user_id} ({'بنك' if mode == 'bank' else 'محفظة'})", "dashboard")
+        balance_key = "bank" if mode == "bank" else "wallet"
+        outcome = {}
+
+        def remove_money(user):
+            try:
+                balance = max(0, int(user.get(balance_key, 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            removed = min(amount, balance)
+            user[balance_key] = balance - removed
+            outcome["removed"] = removed
+            return True
+
+        try:
+            new_data = atomic_update_user(int(user_id), remove_money, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Dashboard money removal failed actor=%s target=%s", actor_id, user_id)
+            return _error("تعذر حفظ السحب المالي. حاول لاحقًا.", 500)
+        if outcome.get("invalid"):
+            return _error("رصيد العضو غير صالح.")
+        try:
+            ranks.log_action(actor_id, actor_name, "remove_money",
+                             f"سحب {outcome['removed']} من {user_id} ({'بنك' if mode == 'bank' else 'محفظة'})", "dashboard")
+        except (OSError, TypeError, ValueError):
+            logger.exception("Could not write Dashboard money audit log")
+        logger.info("dashboard_remove_money actor=%s target=%s amount=%s", actor_id, user_id, outcome["removed"])
         return _json_response({"ok": True, "wallet": new_data["wallet"], "bank": new_data["bank"]})
 
     elif action == "reset":
         if not _session_has(session, "reset_user"):
             return _error("ما عندك صلاحية التصفير", 403)
-        new_data = update_user(int(user_id), {"wallet": 0, "bank": 0})
+        try:
+            new_data = atomic_update_user(
+                int(user_id), lambda user: user.update({"wallet": 0, "bank": 0})
+            )
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Dashboard balance reset failed actor=%s target=%s", actor_id, user_id)
+            return _error("تعذر تصفير الرصيد. حاول لاحقًا.", 500)
         ranks.log_action(actor_id, actor_name, "reset_user", f"تصفير رصيد {user_id}", "dashboard")
         return _json_response({"ok": True, "wallet": new_data["wallet"], "bank": new_data["bank"]})
 
@@ -806,11 +910,19 @@ async def api_staff_code(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
 
     rank = body.get("rank", "")
     note = str(body.get("note", ""))[:100]
+    actor_rank = session.get("rank", "")
+    actor_level = 4 if actor_rank == "owner" else ranks.RANK_LEVELS.get(actor_rank, 0)
+    if rank not in ranks.RANK_LEVELS:
+        return _error("رتبة غير صالحة")
+    if actor_rank != "owner" and ranks.RANK_LEVELS[rank] >= actor_level:
+        return _error("لا يمكنك إنشاء كود لرتبة مساوية أو أعلى من رتبتك.", 403)
     try:
-        count = max(1, min(int(body.get("count", 1)), 10))
+        count = max(1, min(int(body.get("count", 1)), 5))
     except (TypeError, ValueError):
         count = 1
 
@@ -834,8 +946,18 @@ async def api_staff_revoke(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
 
     code = (body.get("code") or "").strip().upper()
+    entry = ranks.list_codes().get(code)
+    if not isinstance(entry, dict):
+        return _error("الكود غير موجود", 404)
+    actor_rank = session.get("rank", "")
+    actor_level = 4 if actor_rank == "owner" else ranks.RANK_LEVELS.get(actor_rank, 0)
+    target_level = ranks.RANK_LEVELS.get(entry.get("rank", ""), 0)
+    if actor_rank != "owner" and target_level >= actor_level:
+        return _error("لا يمكنك سحب كود لرتبة مساوية أو أعلى من رتبتك.", 403)
     if ranks.revoke_code(code):
         actor_id = int(session["user_id"]) if (not session.get("virtual") and session["user_id"].isdigit()) else 0
         ranks.log_action(actor_id, session.get("name", "لوحة التحكم"), "revoke_code", f"سحب {code}", "dashboard")
@@ -844,17 +966,26 @@ async def api_staff_revoke(request: web.Request) -> web.Response:
 
 
 async def api_staff_remove(request: web.Request) -> web.Response:
-    require_permission(request, "manage_staff")
+    session = require_permission(request, "manage_staff")
     try:
         body = await request.json()
     except Exception:
         return _error("طلب غير صالح")
+    if not isinstance(body, dict):
+        return _error("طلب غير صالح")
 
     user_id = str(body.get("user_id") or "").strip()
-    if not user_id.isdigit():
+    if not user_id.isdigit() or int(user_id) <= 0:
         return _error("آيدي غير صالح")
+    actor_rank = session.get("rank", "")
+    target_rank = ranks.get_rank(int(user_id)) or ""
+    actor_level = 4 if actor_rank == "owner" else ranks.RANK_LEVELS.get(actor_rank, 0)
+    target_level = 4 if target_rank == "owner" else ranks.RANK_LEVELS.get(target_rank, 0)
+    if target_rank and actor_rank != "owner" and target_level >= actor_level:
+        return _error("لا يمكنك إزالة عضو رتبته مساوية أو أعلى من رتبتك.", 403)
     if ranks.remove_staff(int(user_id)):
-        ranks.log_action(0, "لوحة التحكم", "remove_staff", f"إزالة {user_id}", "dashboard")
+        actor_id = int(session["user_id"]) if not session.get("virtual") and session["user_id"].isdigit() else 0
+        ranks.log_action(actor_id, session.get("name", "لوحة التحكم"), "remove_staff", f"إزالة {user_id}", "dashboard")
         return _json_response({"ok": True})
     return _error("العضو ما عنده رتبة أو هو المالك", 400)
 
@@ -996,14 +1127,20 @@ async def start_web_server(bot) -> bool:
 
     app = create_web_app(bot)
     runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
     try:
+        await runner.setup()
+        site = web.TCPSite(runner, host, port)
         await site.start()
+        bot._dashboard_runner = runner
         logger.info(f"🖥️ لوحة التحكم تعمل الآن على http://{host}:{port}")
         if not (os.getenv("DASHBOARD_PASSWORD") or cfg.get("password")):
             logger.warning("⚠️ DASHBOARD_PASSWORD غير مضبوط — دخول المالك معطل.")
         return True
     except OSError as e:
         logger.error(f"تعذر تشغيل لوحة التحكم على {host}:{port} — {e}")
+        await runner.cleanup()
+        return False
+    except Exception:
+        logger.exception("Could not start Dashboard server on %s:%s", host, port)
+        await runner.cleanup()
         return False

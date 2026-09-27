@@ -8,11 +8,16 @@ data_manager.py
 """
 
 import json
+import copy
+import logging
+import math
 import os
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 BASE_DIR = Path(__file__).resolve().parent.parent / "data"
 USERS_FILE = BASE_DIR / "users.json"
@@ -21,28 +26,125 @@ MARKET_FILE = BASE_DIR / "market.json"
 LOANS_FILE = BASE_DIR / "loans.json"
 
 _lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
     """يكتب الملف بطريقة ذرية: يكتب بملف مؤقت ثم يستبدل الأصلي.
     هذا يمنع تلف الملف لو انقطع البرنامج أثناء الكتابة."""
-    tmp_path = path.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+    tmp_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if path.is_file():
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        os.replace(tmp_path, path)
+        tmp_path = None
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            logger.exception("Could not fsync data directory %s", path.parent)
+    except (OSError, TypeError, ValueError):
+        logger.exception("Could not atomically write JSON file %s", path)
+        raise
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove temporary JSON file %s", tmp_path)
+
+
+def _quarantine_corrupt_file(path: Path) -> None:
+    fd, corrupt_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".corrupt", dir=path.parent
+    )
+    os.close(fd)
+    corrupt_path = Path(corrupt_name)
+    try:
+        os.replace(path, corrupt_path)
+        logger.error("Quarantined invalid JSON file %s as %s", path, corrupt_path)
+    except OSError:
+        try:
+            corrupt_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove quarantine placeholder %s", corrupt_path)
+        raise
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        _atomic_write(path, default)
-        return default
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        # ملف تالف أو فارغ -> رجّع القيمة الافتراضية بدل ما يطيح البوت
-        _atomic_write(path, default)
-        return default
+            data = json.load(f)
+    except FileNotFoundError:
+        data = copy.deepcopy(default)
+        _atomic_write(path, data)
+        return data
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _quarantine_corrupt_file(path)
+        data = copy.deepcopy(default)
+        _atomic_write(path, data)
+        return data
+    except OSError:
+        logger.exception("Could not read JSON file %s", path)
+        raise
+
+    if not isinstance(data, type(default)):
+        _quarantine_corrupt_file(path)
+        data = copy.deepcopy(default)
+        _atomic_write(path, data)
+    return data
+
+
+def _deep_merge(default: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(default)
+    for key, value in data.items():
+        if key not in merged:
+            merged[key] = copy.deepcopy(value)
+            continue
+        expected = merged[key]
+        if isinstance(expected, dict):
+            if isinstance(value, dict):
+                merged[key] = _deep_merge(expected, value)
+            else:
+                logger.warning("Ignoring setting %s with invalid type", key)
+        elif isinstance(expected, list):
+            if isinstance(value, list):
+                merged[key] = copy.deepcopy(value)
+            else:
+                logger.warning("Ignoring setting %s with invalid type", key)
+        elif isinstance(expected, bool):
+            if isinstance(value, bool):
+                merged[key] = value
+            else:
+                logger.warning("Ignoring setting %s with invalid type", key)
+        elif isinstance(expected, int):
+            if isinstance(value, int) and not isinstance(value, bool):
+                merged[key] = value
+            else:
+                logger.warning("Ignoring setting %s with invalid type", key)
+        elif isinstance(expected, float):
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                merged[key] = float(value)
+            else:
+                logger.warning("Ignoring setting %s with invalid type", key)
+        elif expected is None:
+            merged[key] = copy.deepcopy(value)
+        elif isinstance(value, type(expected)):
+            merged[key] = copy.deepcopy(value)
+        else:
+            logger.warning("Ignoring setting %s with invalid type", key)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +200,7 @@ def get_user(user_id: int, starting_balance: int = 100) -> Dict[str, Any]:
         users = load_users()
         uid = str(user_id)
         if uid not in users:
-            new_user = DEFAULT_USER.copy()
+            new_user = copy.deepcopy(DEFAULT_USER)
             new_user["wallet"] = starting_balance
             users[uid] = new_user
             save_users(users)
@@ -106,8 +208,8 @@ def get_user(user_id: int, starting_balance: int = 100) -> Dict[str, Any]:
             # يضمن إن أي حقول جديدة تضاف بالتحديثات المستقبلية تنضاف تلقائيًا
             for key, value in DEFAULT_USER.items():
                 if key not in users[uid]:
-                    users[uid][key] = value
-        return users[uid]
+                    users[uid][key] = copy.deepcopy(value)
+        return copy.deepcopy(users[uid])
 
 
 def update_user(user_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,39 +218,100 @@ def update_user(user_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
         users = load_users()
         uid = str(user_id)
         if uid not in users:
-            users[uid] = DEFAULT_USER.copy()
-        users[uid].update(updates)
+            users[uid] = copy.deepcopy(DEFAULT_USER)
+        users[uid].update(copy.deepcopy(updates))
         save_users(users)
-        return users[uid]
+        return copy.deepcopy(users[uid])
+
+
+def atomic_update_user(
+    user_id: int,
+    updater: Callable[[Dict[str, Any]], Any],
+    starting_balance: int = 100,
+) -> Dict[str, Any]:
+    """Apply one read-modify-write user operation under the shared data lock."""
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    result = atomic_update_users(
+        [user_id],
+        lambda users: updater(users[str(user_id)]),
+        starting_balance,
+    )
+    return result[str(user_id)]
+
+
+def atomic_update_users(
+    user_ids: List[int],
+    updater: Callable[[Dict[str, Dict[str, Any]]], Any],
+    starting_balance: int = 100,
+) -> Dict[str, Dict[str, Any]]:
+    """Apply one transaction to several users and persist them in one file write."""
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    if not isinstance(user_ids, list) or not user_ids:
+        raise ValueError("user_ids must be a non-empty list")
+    if any(not isinstance(user_id, int) or isinstance(user_id, bool) for user_id in user_ids):
+        raise TypeError("user_ids must contain integers")
+
+    with _lock:
+        users = load_users()
+        selected = {}
+        for uid in {str(user_id) for user_id in user_ids}:
+            user = users.get(uid)
+            if not isinstance(user, dict):
+                user = copy.deepcopy(DEFAULT_USER)
+                user["wallet"] = starting_balance
+            else:
+                user = _deep_merge(DEFAULT_USER, user)
+            selected[uid] = user
+
+        original = copy.deepcopy(selected)
+        should_save = updater(selected)
+        if should_save is False:
+            return original
+        if any(not isinstance(user, dict) for user in selected.values()):
+            raise TypeError("user updates must remain dictionaries")
+        users.update(selected)
+        save_users(users)
+        return copy.deepcopy(selected)
 
 
 def add_wallet(user_id: int, amount: int, max_wallet: int = 1_000_000) -> int:
     """يضيف (أو يطرح إذا كان الرقم سالب) من محفظة المستخدم، مع احترام الحد الأقصى."""
-    with _lock:
-        users = load_users()
-        uid = str(user_id)
-        if uid not in users:
-            users[uid] = DEFAULT_USER.copy()
-        new_balance = users[uid].get("wallet", 0) + amount
-        new_balance = max(0, min(new_balance, max_wallet))
-        users[uid]["wallet"] = new_balance
-        if amount > 0:
-            users[uid]["total_earned"] = users[uid].get("total_earned", 0) + amount
-        save_users(users)
-        return new_balance
+    if not isinstance(amount, int) or isinstance(amount, bool):
+        raise TypeError("wallet amount must be an integer")
+    if not isinstance(max_wallet, int) or isinstance(max_wallet, bool) or max_wallet < 0:
+        raise ValueError("max_wallet must be a non-negative integer")
+    result = {}
+
+    def apply(user):
+        wallet = max(0, int(user.get("wallet", 0)))
+        earned = max(0, int(user.get("total_earned", 0)))
+        new_balance = max(0, min(wallet + amount, max_wallet))
+        actual_change = new_balance - wallet
+        user["wallet"] = new_balance
+        if actual_change > 0:
+            user["total_earned"] = earned + actual_change
+        result["balance"] = new_balance
+
+    atomic_update_user(user_id, apply)
+    return result["balance"]
 
 
 def add_bank(user_id: int, amount: int, max_bank: int = 5_000_000) -> int:
-    with _lock:
-        users = load_users()
-        uid = str(user_id)
-        if uid not in users:
-            users[uid] = DEFAULT_USER.copy()
-        new_balance = users[uid].get("bank", 0) + amount
-        new_balance = max(0, min(new_balance, max_bank))
-        users[uid]["bank"] = new_balance
-        save_users(users)
-        return new_balance
+    if not isinstance(amount, int) or isinstance(amount, bool):
+        raise TypeError("bank amount must be an integer")
+    if not isinstance(max_bank, int) or isinstance(max_bank, bool) or max_bank < 0:
+        raise ValueError("max_bank must be a non-negative integer")
+    result = {}
+
+    def apply(user):
+        bank = max(0, int(user.get("bank", 0)))
+        user["bank"] = max(0, min(bank + amount, max_bank))
+        result["balance"] = user["bank"]
+
+    atomic_update_user(user_id, apply)
+    return result["balance"]
 
 
 def get_leaderboard(limit: int = 10):
@@ -203,6 +366,30 @@ def save_loans(data: Dict[str, Any]) -> None:
         _atomic_write(LOANS_FILE, data)
 
 
+def atomic_update_loans(updater: Callable[[Dict[str, Any]], Any]) -> Dict[str, Any]:
+    """Apply a read-modify-write loan-file operation while holding the shared lock."""
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    with _lock:
+        data = _read_json(LOANS_FILE, {"next_id": 1, "loans": []})
+        if (
+            not isinstance(data.get("next_id"), int) or isinstance(data.get("next_id"), bool)
+            or data["next_id"] < 1 or not isinstance(data.get("loans"), list)
+        ):
+            logger.error("Invalid loan file structure; refusing to update %s", LOANS_FILE)
+            raise ValueError("invalid loan data")
+        original = copy.deepcopy(data)
+        if updater(data) is False:
+            return original
+        if (
+            not isinstance(data.get("next_id"), int) or isinstance(data.get("next_id"), bool)
+            or data["next_id"] < 1 or not isinstance(data.get("loans"), list)
+        ):
+            raise ValueError("loan update produced invalid data")
+        _atomic_write(LOANS_FILE, data)
+        return copy.deepcopy(data)
+
+
 # ---------------------------------------------------------------------------
 # إدارة الإعدادات (تُقرأ من لوحة التحكم أيضًا)
 # ---------------------------------------------------------------------------
@@ -214,18 +401,30 @@ def load_settings() -> Dict[str, Any]:
         data = _read_json(SETTINGS_FILE, {})
     if not isinstance(data, dict):
         data = {}
-    for key, val in DEFAULT_SETTINGS.items():
-        if key not in data:
-            data[key] = val
-        elif isinstance(val, dict) and isinstance(data[key], dict):
-            for k2, v2 in val.items():
-                data[key].setdefault(k2, v2)
-    return data
+    return _deep_merge(DEFAULT_SETTINGS, data)
 
 
 def save_settings(data: Dict[str, Any]) -> None:
+    if not isinstance(data, dict):
+        raise TypeError("settings must be a dictionary")
     with _lock:
-        _atomic_write(SETTINGS_FILE, data)
+        _atomic_write(SETTINGS_FILE, _deep_merge(DEFAULT_SETTINGS, data))
+
+
+def atomic_update_settings(updater: Callable[[Dict[str, Any]], Any]) -> Dict[str, Any]:
+    """Apply one read-modify-write settings operation under the shared lock."""
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    with _lock:
+        data = _deep_merge(DEFAULT_SETTINGS, _read_json(SETTINGS_FILE, {}))
+        original = copy.deepcopy(data)
+        if updater(data) is False:
+            return original
+        if not isinstance(data, dict):
+            raise TypeError("settings update must remain a dictionary")
+        normalized = _deep_merge(DEFAULT_SETTINGS, data)
+        _atomic_write(SETTINGS_FILE, normalized)
+        return copy.deepcopy(normalized)
 
 
 # الإعدادات الافتراضية (تُدمج تلقائيًا لو نقص أي قسم من الملف)

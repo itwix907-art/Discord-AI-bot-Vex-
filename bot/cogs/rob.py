@@ -11,13 +11,17 @@ rob.py
 """
 
 import random
+import logging
+import math
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.utils.data_manager import get_user, update_user, load_settings, now_ts
+from bot.utils.data_manager import atomic_update_users, load_settings, now_ts
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 def fmt_left(seconds: int) -> str:
@@ -44,83 +48,138 @@ class Rob(commands.Cog):
             await ctx.send(embed=error_embed("خطأ", "اختر ضحية صحيحة غيرك!"))
             return
 
-        settings = load_settings()["economy"]
-        robber = get_user(ctx.author.id, settings["starting_balance"])
-        victim = get_user(member.id, settings["starting_balance"])
-        now = now_ts()
+        settings = load_settings().get("economy", {})
+        try:
+            min_wallet = int(cfg.get("min_victim_wallet", 100))
+            cooldown = int(cfg.get("cooldown_minutes", 30)) * 60
+            success_chance = float(cfg.get("success_chance", 45))
+            max_steal_pct = float(cfg.get("max_steal_percent", 40))
+            fine_pct = float(cfg.get("fine_percent", 25))
+            max_wallet = int(settings["max_wallet"])
+            starting_balance = int(settings["starting_balance"])
+            if (
+                min_wallet < 1 or cooldown < 0 or max_wallet < 0
+                or not math.isfinite(success_chance) or not 0 <= success_chance <= 100
+                or not math.isfinite(max_steal_pct) or not 0 < max_steal_pct <= 100
+                or not math.isfinite(fine_pct) or not 0 <= fine_pct <= 100
+            ):
+                raise ValueError("invalid robbery settings")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid robbery settings")
+            await ctx.send(embed=error_embed("خطأ", "إعدادات السرقة غير صالحة."))
+            return
 
-        # كولداون
-        cooldown = int(cfg.get("cooldown_minutes", 30)) * 60
-        elapsed = now - robber.get("last_rob", 0)
-        if elapsed < cooldown:
+        now = now_ts()
+        outcome = {}
+
+        def rob_transaction(users):
+            robber = users[str(ctx.author.id)]
+            victim = users[str(member.id)]
+            try:
+                robber_wallet = max(0, int(robber.get("wallet", 0)))
+                victim_wallet = max(0, int(victim.get("wallet", 0)))
+                last_rob = int(robber.get("last_rob", 0))
+                successes = max(0, int(robber.get("rob_success", 0)))
+                failures = max(0, int(robber.get("rob_fail", 0)))
+                profits = max(0, int(robber.get("rob_profits", 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if last_rob < 0 or last_rob > now:
+                last_rob = 0
+            elapsed = now - last_rob
+            if elapsed < cooldown:
+                outcome["remaining"] = cooldown - elapsed
+                return False
+            if robber_wallet < min_wallet:
+                outcome["poor_robber"] = True
+                return False
+            if victim_wallet < min_wallet:
+                outcome["poor_victim"] = victim_wallet
+                return False
+
+            if random.uniform(0, 100) <= success_chance:
+                capacity = max(0, max_wallet - robber_wallet)
+                stolen = min(
+                    max(1, int(victim_wallet * (max_steal_pct / 100) * random.uniform(0.5, 1.0))),
+                    victim_wallet,
+                    capacity,
+                )
+                if stolen <= 0:
+                    outcome["full"] = True
+                    return False
+                robber.update({
+                    "wallet": robber_wallet + stolen,
+                    "last_rob": now,
+                    "rob_success": successes + 1,
+                    "rob_profits": profits + stolen,
+                })
+                victim["wallet"] = victim_wallet - stolen
+                outcome.update({"success": True, "amount": stolen, "wallet": robber_wallet + stolen})
+            else:
+                fine = min(robber_wallet, max(1, int(robber_wallet * fine_pct / 100)))
+                robber.update({
+                    "wallet": robber_wallet - fine,
+                    "last_rob": now,
+                    "rob_fail": failures + 1,
+                })
+                if cfg.get("fine_to_victim", True):
+                    victim["wallet"] = min(max_wallet, victim_wallet + fine)
+                outcome.update({
+                    "success": False,
+                    "amount": fine,
+                    "wallet": robber_wallet - fine,
+                    "fine_to_victim": bool(cfg.get("fine_to_victim", True)),
+                })
+            return True
+
+        try:
+            atomic_update_users([ctx.author.id, member.id], rob_transaction, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Robbery transaction failed robber=%s victim=%s", ctx.author.id, member.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ نتيجة السرقة. حاول لاحقًا."))
+            return
+        if "remaining" in outcome:
             await ctx.send(embed=error_embed(
                 "ارتاح شوي 😅",
-                f"تقدر تحاول تسرق مرة ثانية بعد **{fmt_left(cooldown - elapsed)}**."
+                f"تقدر تحاول تسرق مرة ثانية بعد **{fmt_left(outcome['remaining'])}**."
             ))
             return
-
-        # الضحية لازم يكون عنده فلوس تُسرق
-        min_wallet = int(cfg.get("min_victim_wallet", 100))
-        if victim["wallet"] < min_wallet:
+        if outcome.get("poor_robber"):
+            await ctx.send(embed=error_embed(
+                "محفظتك فاضية",
+                f"لازم يكون بجيبك على الأقل {currency(min_wallet)} حتى تحاول تسرق."
+            ))
+            return
+        if "poor_victim" in outcome:
             await ctx.send(embed=error_embed(
                 "لا يستاهل",
-                f"محفظة {member.display_name} فيها {currency(victim['wallet'])} — أقل حد للسرقة {currency(min_wallet)}."
+                f"محفظة {member.display_name} فيها {currency(outcome['poor_victim'])} — "
+                f"أقل حد للسرقة {currency(min_wallet)}."
             ))
             return
-        if robber["wallet"] < min_wallet:
-            await ctx.send(embed=error_embed("محفظتك فاضية", f"لازم يكون بجيبك على الأقل {currency(min_wallet)} حتى تحاول تسرق."))
+        if outcome.get("invalid") or outcome.get("full"):
+            await ctx.send(embed=error_embed("خطأ", "تعذر تنفيذ السرقة على هذا الرصيد."))
+            return
 
-        # بيانات الضحية المرسلة قبل التحديث
-        victim_wallet = victim["wallet"]
-        robber_wallet = robber["wallet"]
-        success_chance = float(cfg.get("success_chance", 45))
-        max_steal_pct = float(cfg.get("max_steal_percent", 40))
-
-        update_user(ctx.author.id, {"last_rob": now})
-
-        if random.uniform(0, 100) <= success_chance:
-            # نجاح — سرقة نسبة من محفظة الضحية
-            stolen = int(victim_wallet * (max_steal_pct / 100) * random.uniform(0.5, 1.0))
-            stolen = max(1, stolen)
-            update_user(ctx.author.id, {
-                "wallet": robber_wallet + stolen,
-                "rob_success": robber.get("rob_success", 0) + 1,
-                "rob_profits": robber.get("rob_profits", 0) + stolen,
-            })
-            update_user(member.id, {"wallet": victim_wallet - stolen})
-
+        logger.info(
+            "rob robber=%s victim=%s outcome=%s amount=%s",
+            ctx.author.id, member.id, "success" if outcome["success"] else "failure", outcome["amount"]
+        )
+        if outcome["success"]:
             embed = success_embed(
                 "🚨 سرقة ناجحة!",
-                f"خشيت جيب {member.mention} بسرعة وكسبت **{currency(stolen)}** 🤑"
+                f"خشيت جيب {member.mention} بسرعة وكسبت **{currency(outcome['amount'])}** 🤑"
             )
-            embed.add_field(name="محفظتك الآن", value=currency(robber_wallet + stolen), inline=True)
-            await ctx.send(embed=embed)
+            embed.add_field(name="محفظتك الآن", value=currency(outcome["wallet"]), inline=True)
         else:
-            # فشل — غرامة تروح للضحية
-            fine_pct = float(cfg.get("fine_percent", 25))
-            fine = int(robber_wallet * (fine_pct / 100))
-            fine = max(1, fine)
-
-            if cfg.get("fine_to_victim", True):
-                update_user(ctx.author.id, {
-                    "wallet": robber_wallet - fine,
-                    "rob_fail": robber.get("rob_fail", 0) + 1,
-                })
-                update_user(member.id, {"wallet": victim_wallet + fine})
-                fine_txt = f"الغرامة ({currency(fine)}) رحت للضحية {member.mention} 🤣"
-            else:
-                update_user(ctx.author.id, {
-                    "wallet": robber_wallet - fine,
-                    "rob_fail": robber.get("rob_fail", 0) + 1,
-                })
-                fine_txt = f"دفعت غرامة {currency(fine)} 💸"
-
-            embed = error_embed(
-                "🚔 فشلت السرقة!",
-                f"مسكوك على حار {member.mention}!\n{fine_txt}"
+            fine_txt = (
+                f"الغرامة ({currency(outcome['amount'])}) رحت للضحية {member.mention} 🤣"
+                if outcome["fine_to_victim"] else f"دفعت غرامة {currency(outcome['amount'])} 💸"
             )
-            embed.add_field(name="محفظتك الآن", value=currency(max(0, robber_wallet - fine)), inline=True)
-            await ctx.send(embed=embed)
+            embed = error_embed("🚔 فشلت السرقة!", f"مسكوك على حار {member.mention}!\n{fine_txt}")
+            embed.add_field(name="محفظتك الآن", value=currency(outcome["wallet"]), inline=True)
+        await ctx.send(embed=embed)
 
     # ------------------------------------------------------------- إحصائيات
     @commands.hybrid_command(name="robstats", aliases=["سرقاتي"], description="إحصائيات سرقاتك")

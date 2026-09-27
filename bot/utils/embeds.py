@@ -6,13 +6,21 @@ embeds.py
 
 import discord
 from datetime import datetime, timezone
+import logging
+import math
 from bot.utils.data_manager import load_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _hex_to_int(hex_color: str) -> int:
+    if not isinstance(hex_color, str) or len(hex_color.strip().lstrip("#")) not in (3, 6):
+        logger.warning("Invalid embed color setting; using the default color")
+        return 0xF5A623
     try:
         return int(hex_color.replace("#", ""), 16)
-    except Exception:
+    except (TypeError, ValueError):
+        logger.warning("Invalid embed color setting; using the default color")
         return 0xF5A623
 
 
@@ -41,4 +49,10 @@ def error_embed(title: str, description: str) -> discord.Embed:
 def currency(amount: int) -> str:
     settings = load_settings()
     symbol = settings.get("bot", {}).get("currency_symbol", "🪙")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        logger.warning("Invalid currency amount; displaying zero")
+        amount = 0
+    elif isinstance(amount, float) and not math.isfinite(amount):
+        logger.warning("Non-finite currency amount; displaying zero")
+        amount = 0
     return f"{amount:,} {symbol}"

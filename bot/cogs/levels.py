@@ -11,15 +11,18 @@ levels.py
 """
 
 import random
+import logging
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 from bot.utils.data_manager import (
-    get_user, update_user, load_settings, load_users, get_levels_leaderboard, now_ts
+    atomic_update_user, get_user, load_settings, load_users, get_levels_leaderboard, now_ts
 )
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 def xp_needed(level: int) -> int:
@@ -43,40 +46,66 @@ class Levels(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        cfg = load_settings().get("levels", {})
+        settings = load_settings()
+        cfg = settings.get("levels", {})
         if not cfg.get("enabled", True):
             return
 
-        user = get_user(message.author.id, 100)
         now = now_ts()
-        cooldown = int(cfg.get("xp_cooldown", 60))
-        if now - user.get("last_xp", 0) < cooldown:
+        try:
+            cooldown = int(cfg.get("xp_cooldown", 60))
+            xp_min = int(cfg.get("xp_min", 3))
+            xp_max = int(cfg.get("xp_max", 8))
+            starting_balance = int(settings.get("economy", {}).get("starting_balance", 100))
+            if cooldown < 0 or xp_min < 0 or xp_min > xp_max or xp_max > 10000:
+                raise ValueError("invalid XP settings")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid levels configuration")
             return
+        outcome = {}
 
-        xp_gain = random.randint(int(cfg.get("xp_min", 3)), int(cfg.get("xp_max", 8)))
-        old_level = int(user.get("level", 0))
-        xp = int(user.get("xp", 0)) + xp_gain
-        level = old_level
-        xp_in_level = xp
-
-        # حساب المستويات التراكمية
-        total_needed = 0
-        while True:
-            total_needed += xp_needed(level)
-            if xp_in_level >= total_needed:
+        def award_xp(user):
+            try:
+                last_xp = int(user.get("last_xp", 0))
+                old_level = max(0, int(user.get("level", 0)))
+                xp = max(0, int(user.get("xp", 0)))
+                messages = max(0, int(user.get("messages", 0)))
+                if old_level > 100000 or xp > 1_000_000_000_000:
+                    raise ValueError("stored XP is out of bounds")
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if last_xp < 0 or last_xp > now:
+                last_xp = 0
+            if now - last_xp < cooldown:
+                return False
+            level = old_level
+            xp_in_level = xp + random.randint(xp_min, xp_max)
+            for _ in range(1000):
+                needed = xp_needed(level)
+                if xp_in_level < needed or level >= 100000:
+                    break
+                xp_in_level -= needed
                 level += 1
-                xp_in_level -= total_needed
-                total_needed = 0
-            else:
-                break
+            user.update({
+                "xp": xp_in_level,
+                "level": level,
+                "last_xp": now,
+                "messages": messages + 1,
+            })
+            outcome.update({"old_level": old_level, "level": level})
+            return True
 
-        # نحفظ الخبرة كخبرة داخل المستوى الحالي (أبسط للعرض)
-        updates = {"xp": xp_in_level, "level": level, "last_xp": now,
-                   "messages": int(user.get("messages", 0)) + 1}
-        update_user(message.author.id, updates)
-
-        if level > old_level:
-            await self._handle_level_up(message, level)
+        try:
+            atomic_update_user(message.author.id, award_xp, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("XP update failed user=%s guild=%s", message.author.id, message.guild.id)
+            return
+        if outcome.get("invalid"):
+            logger.warning("Invalid saved XP data user=%s", message.author.id)
+            return
+        if outcome.get("level", 0) > outcome.get("old_level", 0):
+            await self._handle_level_up(message, outcome["level"])
 
     # ------------------------------------------------------------- ترقية مستوى
     async def _handle_level_up(self, message: discord.Message, new_level: int):
@@ -100,18 +129,45 @@ class Levels(commands.Cog):
                     delete_after=10
                 )
             except discord.HTTPException:
-                pass
+                logger.exception("Could not announce level up guild=%s user=%s", message.guild.id, message.author.id)
 
         # رتب تلقائية
         role_entries = cfg.get("level_roles", []) or []
-        for entry in sorted(role_entries, key=lambda e: e.get("level", 0), reverse=True):
-            if new_level >= int(entry.get("level", 0)) and entry.get("role_id"):
-                role = message.guild.get_role(int(entry["role_id"]))
+        if not isinstance(role_entries, list):
+            logger.warning("Invalid level_roles setting; expected a list")
+            return
+        parsed_entries = []
+        for entry in role_entries[:1000]:
+            if not isinstance(entry, dict):
+                logger.warning("Ignoring malformed automatic level-role entry")
+                continue
+            try:
+                required_level = max(0, int(entry.get("level", 0)))
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Ignoring automatic level-role entry with invalid level")
+                continue
+            parsed_entries.append((required_level, entry))
+
+        for required_level, entry in sorted(parsed_entries, key=lambda item: item[0], reverse=True):
+            if new_level >= required_level and entry.get("role_id"):
+                try:
+                    role_id = int(entry["role_id"])
+                except (TypeError, ValueError, OverflowError):
+                    logger.warning("Ignoring automatic level-role entry with invalid role ID")
+                    continue
+                role = message.guild.get_role(role_id)
                 if role and role not in message.author.roles:
+                    bot_member = message.guild.me
+                    if bot_member is None or role >= bot_member.top_role or role.managed:
+                        logger.warning(
+                            "Automatic level role blocked by bot hierarchy guild=%s role=%s user=%s",
+                            message.guild.id, role.id, message.author.id,
+                        )
+                        break
                     try:
                         await message.author.add_roles(role, reason=f"وصل المستوى {new_level}")
                     except discord.HTTPException:
-                        pass
+                        logger.exception("Could not grant level role guild=%s role=%s user=%s", message.guild.id, role.id, message.author.id)
                 break
 
     # ------------------------------------------------------------- بطاقة المستوى

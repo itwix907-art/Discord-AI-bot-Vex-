@@ -10,15 +10,18 @@ stocks.py
 """
 
 import random
+import logging
+import math
 
-import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot.utils.data_manager import (
-    get_user, update_user, load_settings, load_market, save_market, now_ts
+    atomic_update_user, get_user, load_settings, load_market, save_market, now_ts
 )
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
+
+logger = logging.getLogger(__name__)
 
 
 def _init_prices(market: dict, symbols_cfg: list) -> dict:
@@ -127,47 +130,89 @@ class Stocks(commands.Cog):
         if not cfg.get("enabled", True):
             await ctx.send(embed=error_embed("معطل", "نظام الأسهم معطل حاليًا."))
             return
-        if qty <= 0:
-            await ctx.send(embed=error_embed("خطأ", "الكمية لازم تكون أكبر من صفر."))
+        if not isinstance(qty, int) or isinstance(qty, bool) or not 1 <= qty <= 1_000_000:
+            await ctx.send(embed=error_embed("خطأ", "الكمية لازم تكون بين 1 و 1,000,000."))
             return
 
-        symbol = symbol.upper()
-        sym_cfg = next((s for s in cfg.get("symbols", []) if s["symbol"].upper() == symbol), None)
+        symbol = str(symbol).upper()
+        symbols = cfg.get("symbols", [])
+        if not isinstance(symbols, list):
+            await ctx.send(embed=error_embed("خطأ", "إعدادات الأسهم غير صالحة."))
+            return
+        sym_cfg = next((s for s in symbols if isinstance(s, dict) and str(s.get("symbol", "")).upper() == symbol), None)
         if not sym_cfg:
             await ctx.send(embed=error_embed("سهم غير موجود", "شوف الأسهم المتاحة بأمر `/stocks`."))
             return
 
-        market = _init_prices(load_market(), cfg.get("symbols", []))
-        price = market["prices"][symbol]["price"]
-        cost = int(round(price * qty))
-
-        settings = load_settings()["economy"]
-        user = get_user(ctx.author.id, settings["starting_balance"])
-        if user["wallet"] < cost:
-            await ctx.send(embed=error_embed(
-                "رصيد غير كافي",
-                f"سعر السهم `{price:,.2f}` × {qty} = {currency(cost)}\nومحفظتك فيها {currency(user['wallet'])} فقط."
-            ))
+        try:
+            market = _init_prices(load_market(), symbols)
+            price = float(market["prices"][symbol]["price"])
+            settings = load_settings().get("economy", {})
+            max_wallet = int(settings["max_wallet"])
+            starting_balance = int(settings["starting_balance"])
+            if not math.isfinite(price) or price <= 0 or max_wallet < 0:
+                raise ValueError("invalid stock price or wallet limit")
+            cost = int(round(price * qty))
+            if cost <= 0 or cost > max_wallet:
+                raise ValueError("stock purchase exceeds configured limits")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            logger.exception("Invalid stock purchase data user=%s symbol=%s", ctx.author.id, symbol)
+            await ctx.send(embed=error_embed("خطأ", "سعر السهم أو إعدادات المحفظة غير صالحة."))
             return
 
-        # تحديث المحفظة (متوسط تكلفة الشراء)
-        portfolio = user.get("stocks", {}) or {}
-        holding = portfolio.get(symbol, {"qty": 0, "avg_cost": 0})
-        total_qty = holding["qty"] + qty
-        avg_cost = ((holding["avg_cost"] * holding["qty"]) + cost) / total_qty
-        portfolio[symbol] = {"qty": total_qty, "avg_cost": round(avg_cost, 2)}
+        outcome = {}
 
-        update_user(ctx.author.id, {
-            "wallet": user["wallet"] - cost,
-            "stocks": portfolio
-        })
+        def buy_shares(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+                portfolio = user.get("stocks", {})
+                if not isinstance(portfolio, dict):
+                    raise ValueError("invalid stock portfolio")
+                holding = portfolio.get(symbol, {"qty": 0, "avg_cost": 0})
+                held_qty = int(holding.get("qty", 0))
+                average_cost = float(holding.get("avg_cost", 0))
+                if held_qty < 0 or not math.isfinite(average_cost) or average_cost < 0:
+                    raise ValueError("invalid stock holding")
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if wallet < cost:
+                outcome["insufficient"] = True
+                return False
+            total_qty = held_qty + qty
+            if total_qty > 1_000_000:
+                outcome["invalid"] = True
+                return False
+            avg_cost = ((average_cost * held_qty) + cost) / total_qty
+            portfolio = dict(portfolio)
+            portfolio[symbol] = {"qty": total_qty, "avg_cost": round(avg_cost, 2)}
+            user.update({"wallet": wallet - cost, "stocks": portfolio})
+            outcome["avg_cost"] = avg_cost
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, buy_shares, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Stock purchase failed user=%s symbol=%s", ctx.author.id, symbol)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ عملية الشراء. حاول لاحقًا."))
+            return
+        if outcome.get("insufficient"):
+            await ctx.send(embed=error_embed(
+                "رصيد غير كافي",
+                f"سعر السهم `{price:,.2f}` × {qty} = {currency(cost)}\nومحفظتك لا تغطي العملية."
+            ))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات محفظتك الاستثمارية غير صالحة."))
+            return
 
         embed = success_embed(
             "تم الشراء",
             f"{sym_cfg.get('emoji', '📈')} اشتريت **{qty} سهم {symbol}** بسعر `{price:,.2f}`\n"
             f"💰 الإجمالي المدفوع: {currency(cost)}"
         )
-        embed.add_field(name="متوسط تكلفة سهمك", value=f"`{avg_cost:,.2f}`", inline=True)
+        embed.add_field(name="متوسط تكلفة سهمك", value=f"`{outcome['avg_cost']:,.2f}`", inline=True)
+        logger.info("stock_buy user=%s symbol=%s qty=%s cost=%s", ctx.author.id, symbol, qty, cost)
         await ctx.send(embed=embed)
 
     # ------------------------------------------------------------- بيع
@@ -179,51 +224,89 @@ class Stocks(commands.Cog):
             await ctx.send(embed=error_embed("معطل", "نظام الأسهم معطل حاليًا."))
             return
 
-        symbol = symbol.upper()
-        settings = load_settings()["economy"]
-        user = get_user(ctx.author.id, settings["starting_balance"])
-        portfolio = user.get("stocks", {}) or {}
-        holding = portfolio.get(symbol)
+        symbol = str(symbol).upper()
+        all_shares = isinstance(qty, str) and qty.lower() in ("all", "الكل", "كل")
+        try:
+            requested_qty = None if all_shares else int(qty)
+            settings = load_settings().get("economy", {})
+            max_wallet = int(settings["max_wallet"])
+            starting_balance = int(settings["starting_balance"])
+            market = _init_prices(load_market(), cfg.get("symbols", []))
+            price = float(market["prices"][symbol]["price"])
+            if not math.isfinite(price) or price <= 0 or max_wallet < 0:
+                raise ValueError("invalid stock price or wallet limit")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            await ctx.send(embed=error_embed("خطأ", "رمز السهم أو إعدادات المحفظة غير صالحة."))
+            return
 
-        if not holding or holding["qty"] <= 0:
+        outcome = {}
+
+        def sell_shares(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+                portfolio = user.get("stocks", {})
+                if not isinstance(portfolio, dict):
+                    raise ValueError("invalid stock portfolio")
+                holding = portfolio.get(symbol)
+                if not isinstance(holding, dict):
+                    outcome["missing"] = True
+                    return False
+                held_qty = int(holding.get("qty", 0))
+                average_cost = float(holding.get("avg_cost", 0))
+                if held_qty <= 0 or not math.isfinite(average_cost) or average_cost < 0:
+                    raise ValueError("invalid stock holding")
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            sell_qty = held_qty if all_shares else requested_qty
+            if sell_qty is None or sell_qty <= 0 or sell_qty > held_qty:
+                outcome["held_qty"] = held_qty
+                return False
+            revenue = int(round(price * sell_qty))
+            if wallet + revenue > max_wallet:
+                outcome["wallet_limit"] = True
+                return False
+            updated_portfolio = dict(portfolio)
+            remaining = held_qty - sell_qty
+            if remaining:
+                updated_portfolio[symbol] = {"qty": remaining, "avg_cost": average_cost}
+            else:
+                updated_portfolio.pop(symbol, None)
+            user.update({"wallet": wallet + revenue, "stocks": updated_portfolio})
+            outcome.update({
+                "qty": sell_qty,
+                "revenue": revenue,
+                "profit": int(round((price - average_cost) * sell_qty)),
+            })
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, sell_shares, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Stock sale failed user=%s symbol=%s", ctx.author.id, symbol)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ عملية البيع. حاول لاحقًا."))
+            return
+        if outcome.get("missing"):
             await ctx.send(embed=error_embed("ما عندك أسهم", f"ما تملك أي سهم من نوع `{symbol}`."))
             return
-
-        if str(qty).lower() in ("all", "الكل", "كل"):
-            sell_qty = holding["qty"]
-        else:
-            try:
-                sell_qty = int(qty)
-            except ValueError:
-                await ctx.send(embed=error_embed("خطأ", "اكتب رقم صحيح أو `all`."))
-                return
-
-        if sell_qty <= 0 or sell_qty > holding["qty"]:
-            await ctx.send(embed=error_embed("خطأ", f"تملك {holding['qty']} سهم فقط من `{symbol}`."))
+        if outcome.get("wallet_limit"):
+            await ctx.send(embed=error_embed("تجاوزت الحد", "بيع هذه الكمية سيتجاوز سقف المحفظة."))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات محفظتك الاستثمارية غير صالحة."))
+            return
+        if "held_qty" in outcome:
+            await ctx.send(embed=error_embed("خطأ", f"تملك {outcome['held_qty']} سهم فقط من `{symbol}`."))
             return
 
-        market = _init_prices(load_market(), cfg.get("symbols", []))
-        price = market["prices"][symbol]["price"]
-        revenue = int(round(price * sell_qty))
-        profit = int(round((price - holding["avg_cost"]) * sell_qty))
-
-        remaining = holding["qty"] - sell_qty
-        if remaining > 0:
-            portfolio[symbol]["qty"] = remaining
-        else:
-            del portfolio[symbol]
-
-        update_user(ctx.author.id, {
-            "wallet": user["wallet"] + revenue,
-            "stocks": portfolio
-        })
-
+        profit = outcome["profit"]
         profit_txt = f"{'🟢 ربح' if profit >= 0 else '🔴 خسارة'}: {currency(abs(profit))}"
         embed = success_embed(
             "تم البيع",
-            f"بعت **{sell_qty} سهم {symbol}** بسعر `{price:,.2f}`\n"
-            f"💵 حصلت على: {currency(revenue)}\n{profit_txt}"
+            f"بعت **{outcome['qty']} سهم {symbol}** بسعر `{price:,.2f}`\n"
+            f"💵 حصلت على: {currency(outcome['revenue'])}\n{profit_txt}"
         )
+        logger.info("stock_sell user=%s symbol=%s qty=%s revenue=%s", ctx.author.id, symbol, outcome["qty"], outcome["revenue"])
         await ctx.send(embed=embed)
 
     # ------------------------------------------------------------- المحفظة الاستثمارية

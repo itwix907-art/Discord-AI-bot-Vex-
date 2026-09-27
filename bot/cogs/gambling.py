@@ -6,15 +6,17 @@ gambling.py
 
 import random
 import asyncio
+import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.utils.data_manager import get_user, add_wallet, load_settings
+from bot.utils.data_manager import atomic_update_user, add_wallet, load_settings
 from bot.utils.embeds import base_embed, success_embed, error_embed, currency
 
 SLOT_EMOJIS = ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
+logger = logging.getLogger(__name__)
 
 
 def check_gambling_enabled():
@@ -37,6 +39,7 @@ class BlackjackView(discord.ui.View):
         self.player = [self.deck.pop(), self.deck.pop()]
         self.dealer = [self.deck.pop(), self.deck.pop()]
         self.finished = False
+        self.action_lock = asyncio.Lock()
 
     def _new_deck(self):
         suits = ["♠️", "♥️", "♦️", "♣️"]
@@ -91,14 +94,18 @@ class BlackjackView(discord.ui.View):
         return embed
 
     async def end_game(self, interaction, outcome: str):
+        if self.finished:
+            await interaction.response.send_message("انتهت هذه الجولة بالفعل.", ephemeral=True)
+            return
         self.finished = True
         for child in self.children:
             child.disabled = True
 
         if outcome == "win":
-            add_wallet(self.ctx.author.id, self.bet, self.max_wallet)
+            add_wallet(self.ctx.author.id, self.bet * 2, self.max_wallet)
             text = f"🎉 فزت! ربحت {currency(self.bet)}"
         elif outcome == "push":
+            add_wallet(self.ctx.author.id, self.bet, self.max_wallet)
             text = "🤝 تعادل! رجع لك رهانك."
         elif outcome == "blackjack":
             win_amount = int(self.bet * 1.5)
@@ -106,6 +113,7 @@ class BlackjackView(discord.ui.View):
             text = f"🂡 بلاك جاك! ربحت {currency(win_amount)}"
         else:
             text = f"💥 خسرت {currency(self.bet)}"
+        logger.info("blackjack_settlement user=%s outcome=%s bet=%s", self.ctx.author.id, outcome, self.bet)
 
         embed = self.build_embed(reveal_dealer=True, result_text=text)
         await interaction.response.edit_message(embed=embed, view=self)
@@ -116,34 +124,44 @@ class BlackjackView(discord.ui.View):
         if interaction.user.id != self.ctx.author.id:
             await interaction.response.send_message("هذي مو لعبتك!", ephemeral=True)
             return
-        self.player.append(self.deck.pop())
-        if self.hand_value(self.player) > 21:
-            await self.end_game(interaction, "lose")
-            return
-        embed = self.build_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+        async with self.action_lock:
+            if self.finished:
+                await interaction.response.send_message("انتهت هذه الجولة بالفعل.", ephemeral=True)
+                return
+            self.player.append(self.deck.pop())
+            if self.hand_value(self.player) > 21:
+                await self.end_game(interaction, "lose")
+                return
+            embed = self.build_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="وقف (Stand)", style=discord.ButtonStyle.secondary, emoji="✋")
     async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ctx.author.id:
             await interaction.response.send_message("هذي مو لعبتك!", ephemeral=True)
             return
-        while self.hand_value(self.dealer) < 17:
-            self.dealer.append(self.deck.pop())
+        async with self.action_lock:
+            if self.finished:
+                await interaction.response.send_message("انتهت هذه الجولة بالفعل.", ephemeral=True)
+                return
+            while self.hand_value(self.dealer) < 17:
+                self.dealer.append(self.deck.pop())
 
-        player_val = self.hand_value(self.player)
-        dealer_val = self.hand_value(self.dealer)
+            player_val = self.hand_value(self.player)
+            dealer_val = self.hand_value(self.dealer)
 
-        if dealer_val > 21 or player_val > dealer_val:
-            await self.end_game(interaction, "win")
-        elif player_val == dealer_val:
-            await self.end_game(interaction, "push")
-        else:
-            await self.end_game(interaction, "lose")
+            if dealer_val > 21 or player_val > dealer_val:
+                await self.end_game(interaction, "win")
+            elif player_val == dealer_val:
+                await self.end_game(interaction, "push")
+            else:
+                await self.end_game(interaction, "lose")
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        async with self.action_lock:
+            self.finished = True
+            for child in self.children:
+                child.disabled = True
 
 
 class Gambling(commands.Cog):
@@ -159,38 +177,85 @@ class Gambling(commands.Cog):
         g = settings["gambling"]
         e = settings["economy"]
 
-        if bet < g["slots_min_bet"] or bet > g["slots_max_bet"]:
+        try:
+            minimum = int(g["slots_min_bet"])
+            maximum = int(g["slots_max_bet"])
+            win_multiplier = int(g["slots_win_multiplier"])
+            jackpot_multiplier = int(g["slots_jackpot_multiplier"])
+            starting_balance = int(e["starting_balance"])
+            max_wallet = int(e["max_wallet"])
+            if (
+                not isinstance(bet, int) or isinstance(bet, bool)
+                or min(minimum, maximum, max_wallet) < 0 or minimum > maximum
+                or not 1 <= win_multiplier <= 100 or not 1 <= jackpot_multiplier <= 100
+            ):
+                raise ValueError("invalid slots settings")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            await ctx.send(embed=error_embed("خطأ", "إعدادات السلوتس غير صالحة."))
+            return
+        if bet < minimum or bet > maximum:
             await ctx.send(embed=error_embed(
                 "رهان غير صالح",
-                f"الرهان لازم يكون بين {currency(g['slots_min_bet'])} و {currency(g['slots_max_bet'])}"
+                f"الرهان لازم يكون بين {currency(minimum)} و {currency(maximum)}"
             ))
             return
 
-        user = get_user(ctx.author.id, e["starting_balance"])
-        if user["wallet"] < bet:
-            await ctx.send(embed=error_embed("رصيد غير كافي", "ما عندك فلوس كافية لهذا الرهان."))
-            return
-
-        add_wallet(ctx.author.id, -bet, e["max_wallet"])
-
         result = [random.choice(SLOT_EMOJIS) for _ in range(3)]
         display = " | ".join(result)
-
+        multiplier = 0
+        title = ""
         if result[0] == result[1] == result[2]:
             if result[0] == "7️⃣":
-                winnings = bet * g["slots_jackpot_multiplier"]
+                multiplier = jackpot_multiplier
                 title = "💎 جاكبوت! 💎"
             else:
-                winnings = bet * g["slots_win_multiplier"]
+                multiplier = win_multiplier
                 title = "🎉 فوز! 🎉"
-            add_wallet(ctx.author.id, winnings, e["max_wallet"])
-            embed = success_embed(title, f"[ {display} ]\nربحت {currency(winnings)}")
         elif result[0] == result[1] or result[1] == result[2]:
-            winnings = int(bet * 1.2)
-            add_wallet(ctx.author.id, winnings, e["max_wallet"])
-            embed = success_embed("زوج! 🎊", f"[ {display} ]\nربحت {currency(winnings)}")
+            multiplier = 1
+            title = "زوج! 🎊"
+
+        if multiplier < 0 or (multiplier and multiplier > 100):
+            await ctx.send(embed=error_embed("خطأ", "إعدادات السلوتس غير صالحة."))
+            return
+        winnings = bet * multiplier if multiplier > 1 else int(bet * 1.2) if multiplier == 1 else 0
+        outcome = {}
+
+        def play(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+                earned = max(0, int(user.get("total_earned", 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if wallet < bet:
+                outcome["insufficient"] = True
+                return False
+            remaining_wallet = wallet - bet
+            actual_win = min(winnings, max(0, max_wallet - remaining_wallet))
+            user["wallet"] = remaining_wallet + actual_win
+            if actual_win:
+                user["total_earned"] = earned + actual_win
+            outcome["winnings"] = actual_win
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, play, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Slots transaction failed user=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ نتيجة الرهان."))
+            return
+        if outcome.get("insufficient"):
+            await ctx.send(embed=error_embed("رصيد غير كافي", "ما عندك فلوس كافية لهذا الرهان."))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات محفظتك غير صالحة."))
+            return
+        if outcome["winnings"]:
+            embed = success_embed(title, f"[ {display} ]\nربحت {currency(outcome['winnings'])}")
         else:
             embed = error_embed("خسرت 😢", f"[ {display} ]\nخسرت {currency(bet)}")
+        logger.info("slots user=%s bet=%s winnings=%s", ctx.author.id, bet, outcome["winnings"])
 
         await ctx.send(embed=embed)
 
@@ -207,31 +272,70 @@ class Gambling(commands.Cog):
         g = settings["gambling"]
         e = settings["economy"]
 
-        if bet < g["coinflip_min_bet"] or bet > g["coinflip_max_bet"]:
+        try:
+            minimum = int(g["coinflip_min_bet"])
+            maximum = int(g["coinflip_max_bet"])
+            starting_balance = int(e["starting_balance"])
+            max_wallet = int(e["max_wallet"])
+            if not isinstance(bet, int) or isinstance(bet, bool) or min(minimum, maximum, max_wallet) < 0 or minimum > maximum:
+                raise ValueError("invalid coinflip settings")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            await ctx.send(embed=error_embed("خطأ", "إعدادات رهان العملة غير صالحة."))
+            return
+        if bet < minimum or bet > maximum:
             await ctx.send(embed=error_embed(
                 "رهان غير صالح",
                 f"الرهان لازم يكون بين {currency(g['coinflip_min_bet'])} و {currency(g['coinflip_max_bet'])}"
             ))
             return
 
-        user = get_user(ctx.author.id, e["starting_balance"])
-        if user["wallet"] < bet:
-            await ctx.send(embed=error_embed("رصيد غير كافي", "ما عندك فلوس كافية لهذا الرهان."))
+        if not isinstance(choice, str) or choice.lower() not in {"heads", "tails"}:
+            await ctx.send(embed=error_embed("خطأ", "اختر وجه أو كتابة."))
             return
-
         choice = choice.lower()
         result = random.choice(["heads", "tails"])
-        add_wallet(ctx.author.id, -bet, e["max_wallet"])
+        winnings = bet * 2 if choice == result else 0
+        outcome = {}
+
+        def play(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+                earned = max(0, int(user.get("total_earned", 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if wallet < bet:
+                outcome["insufficient"] = True
+                return False
+            remaining_wallet = wallet - bet
+            actual_win = min(winnings, max(0, max_wallet - remaining_wallet))
+            user["wallet"] = remaining_wallet + actual_win
+            if actual_win:
+                user["total_earned"] = earned + actual_win
+            outcome["winnings"] = actual_win
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, play, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Coinflip transaction failed user=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حفظ نتيجة الرهان."))
+            return
+        if outcome.get("insufficient"):
+            await ctx.send(embed=error_embed("رصيد غير كافي", "ما عندك فلوس كافية لهذا الرهان."))
+            return
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات محفظتك غير صالحة."))
+            return
 
         result_ar = "وجه 🪙" if result == "heads" else "كتابة 🎯"
 
         if choice == result:
-            winnings = bet * 2
-            add_wallet(ctx.author.id, winnings, e["max_wallet"])
-            embed = success_embed("ربحت!", f"النتيجة: {result_ar}\nربحت {currency(winnings)}")
+            embed = success_embed("ربحت!", f"النتيجة: {result_ar}\nربحت {currency(outcome['winnings'])}")
         else:
             embed = error_embed("خسرت", f"النتيجة: {result_ar}\nخسرت {currency(bet)}")
 
+        logger.info("coinflip user=%s bet=%s winnings=%s", ctx.author.id, bet, outcome["winnings"])
         await ctx.send(embed=embed)
 
     # -------------------------------------------------------------- بلاك جاك
@@ -240,22 +344,54 @@ class Gambling(commands.Cog):
     @check_gambling_enabled()
     async def blackjack(self, ctx: commands.Context, bet: int):
         settings = load_settings()
-        g = settings["gambling"]
-        e = settings["economy"]
-
-        if bet < g["blackjack_min_bet"] or bet > g["blackjack_max_bet"]:
+        g = settings.get("gambling", {})
+        e = settings.get("economy", {})
+        try:
+            minimum = int(g["blackjack_min_bet"])
+            maximum = int(g["blackjack_max_bet"])
+            max_wallet = int(e["max_wallet"])
+            starting_balance = int(e["starting_balance"])
+            if (
+                not isinstance(bet, int) or isinstance(bet, bool)
+                or min(minimum, maximum, max_wallet) < 0 or minimum > maximum
+            ):
+                raise ValueError("invalid Blackjack settings")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            await ctx.send(embed=error_embed("خطأ", "إعدادات البلاك جاك غير صالحة."))
+            return
+        if bet < minimum or bet > maximum:
             await ctx.send(embed=error_embed(
                 "رهان غير صالح",
-                f"الرهان لازم يكون بين {currency(g['blackjack_min_bet'])} و {currency(g['blackjack_max_bet'])}"
+                f"الرهان لازم يكون بين {currency(minimum)} و {currency(maximum)}"
             ))
             return
 
-        user = get_user(ctx.author.id, e["starting_balance"])
-        if user["wallet"] < bet:
+        outcome = {}
+
+        def place_bet(user):
+            try:
+                wallet = max(0, int(user.get("wallet", 0)))
+            except (TypeError, ValueError, OverflowError):
+                outcome["invalid"] = True
+                return False
+            if wallet < bet:
+                outcome["insufficient"] = True
+                return False
+            user["wallet"] = wallet - bet
+            return True
+
+        try:
+            atomic_update_user(ctx.author.id, place_bet, starting_balance)
+        except (OSError, TypeError, ValueError, OverflowError):
+            logger.exception("Blackjack stake failed user=%s", ctx.author.id)
+            await ctx.send(embed=error_embed("خطأ", "تعذر حجز الرهان."))
+            return
+        if outcome.get("insufficient"):
             await ctx.send(embed=error_embed("رصيد غير كافي", "ما عندك فلوس كافية لهذا الرهان."))
             return
-
-        add_wallet(ctx.author.id, -bet, e["max_wallet"])
+        if outcome.get("invalid"):
+            await ctx.send(embed=error_embed("خطأ", "بيانات محفظتك غير صالحة."))
+            return
 
         view = BlackjackView(ctx, bet, e["max_wallet"])
 

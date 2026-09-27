@@ -110,13 +110,23 @@ async def main():
         await load_cogs()
         # تشغيل لوحة التحكم (نفس العملية — كل تعديل باللوحة يظهر فورًا بالبوت)
         dashboard_started = await start_web_server(bot)
-        if not TOKEN or TOKEN == "ضع_التوكن_هنا":
-            logger.error("لم يتم ضبط DISCORD_TOKEN! افتح ملف .env وضع التوكن الصحيح.")
-            if dashboard_started:
-                logger.warning("لوحة التحكم تعمل بوضع الإعداد فقط حتى تتم إضافة DISCORD_TOKEN و OWNER_ID.")
-                await asyncio.Event().wait()
-            return
-        await bot.start(TOKEN)
+        try:
+            if not TOKEN or TOKEN == "ضع_التوكن_هنا":
+                logger.error("لم يتم ضبط DISCORD_TOKEN! افتح ملف .env وضع التوكن الصحيح.")
+                if dashboard_started:
+                    logger.warning("لوحة التحكم تعمل بوضع الإعداد فقط حتى تتم إضافة DISCORD_TOKEN و OWNER_ID.")
+                    await asyncio.Event().wait()
+                return
+            await bot.start(TOKEN)
+        finally:
+            runner = getattr(bot, "_dashboard_runner", None)
+            if runner is not None:
+                try:
+                    await runner.cleanup()
+                except Exception:
+                    logger.exception("Could not close Dashboard server")
+                finally:
+                    delattr(bot, "_dashboard_runner")
 
 
 if __name__ == "__main__":

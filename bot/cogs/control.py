@@ -2,16 +2,51 @@
 All commands are hybrid commands, so every command is available as /slash and prefix.
 """
 import asyncio
-import io
+import ipaddress
+import logging
 import math
+import socket
 from typing import Optional
+from urllib.parse import urlsplit
+import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
 
+logger = logging.getLogger(__name__)
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+class PublicResolver(aiohttp.abc.AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        records = await asyncio.get_running_loop().getaddrinfo(
+            host, port, family=family, type=socket.SOCK_STREAM
+        )
+        resolved = []
+        for address_family, socket_type, protocol, _, sockaddr in records:
+            address = sockaddr[0]
+            if not ipaddress.ip_address(address).is_global:
+                raise OSError("Image URL resolves to a non-public address")
+            resolved.append({
+                "hostname": host,
+                "host": address,
+                "port": port,
+                "family": address_family,
+                "proto": protocol,
+                "flags": 0,
+            })
+        if not resolved:
+            raise OSError("Image URL has no public address")
+        return resolved
+
+    async def close(self):
+        return None
+
 
 def need(permission: str):
     async def predicate(ctx: commands.Context):
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage("This command can only be used in a server.")
         from bot.utils import ranks
         if getattr(ctx, "dashboard_session", None) is not None and ctx.dashboard_session.get("virtual"):
             if permission in ranks.DEFAULT_PERMISSIONS.get(ctx.dashboard_session.get("rank", ""), []):
@@ -23,7 +58,102 @@ def need(permission: str):
 
 
 class Control(commands.Cog):
-    def __init__(self, bot): self.bot = bot
+    def __init__(self, bot):
+        self.bot = bot
+        self._lockdown_lock = asyncio.Lock()
+        self.http_session = None
+
+    async def cog_load(self):
+        connector = aiohttp.TCPConnector(resolver=PublicResolver(), limit=4, ttl_dns_cache=300)
+        self.http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10, connect=3, sock_read=5),
+            connector=connector,
+        )
+
+    async def cog_unload(self):
+        if self.http_session is not None and not self.http_session.closed:
+            await self.http_session.close()
+
+    async def _download_image(self, url):
+        if not isinstance(url, str) or len(url) > 2048:
+            raise ValueError("invalid image URL")
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "https" or not parsed.hostname or parsed.username
+            or parsed.password or parsed.port not in (None, 443)
+        ):
+            raise ValueError("image URL must use public HTTPS")
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+            if not address.is_global:
+                raise ValueError("image URL must use a public host")
+        except ValueError:
+            if parsed.hostname.replace(".", "").isdigit():
+                raise ValueError("invalid image host") from None
+        if self.http_session is None or self.http_session.closed:
+            raise RuntimeError("image client is unavailable")
+        async with self.http_session.get(url, allow_redirects=False) as response:
+            if response.status != 200:
+                raise ValueError("image host returned an unsuccessful response")
+            if response.content_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+                raise ValueError("unsupported image content type")
+            if response.content_length is not None and response.content_length > MAX_IMAGE_BYTES:
+                raise ValueError("image response is too large")
+            data = await response.content.read(MAX_IMAGE_BYTES + 1)
+            if not data or len(data) > MAX_IMAGE_BYTES:
+                raise ValueError("image response is empty or too large")
+            return data
+
+    async def cog_command_error(self, ctx, error):
+        original = getattr(error, "original", error)
+        if isinstance(original, (discord.Forbidden, discord.HTTPException)):
+            logger.warning("Control command rejected by Discord: %s", type(original).__name__)
+            await self._reply(ctx, "❌ تعذر تنفيذ العملية بسبب صلاحيات البوت أو خطأ من Discord.", True)
+            return
+        logger.exception("Control command failed", exc_info=original)
+        await self._reply(ctx, "❌ تعذر تنفيذ العملية. راجع سجل البوت للتفاصيل.", True)
+
+    async def cog_app_command_error(self, interaction, error):
+        original = getattr(error, "original", error)
+        if isinstance(original, (discord.Forbidden, discord.HTTPException)):
+            logger.warning("Control slash command rejected by Discord: %s", type(original).__name__)
+            message = "❌ تعذر تنفيذ العملية بسبب صلاحيات البوت أو خطأ من Discord."
+        else:
+            logger.error("Control slash command failed: %s", type(original).__name__, exc_info=original)
+            message = "❌ تعذر تنفيذ العملية. راجع سجل البوت للتفاصيل."
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+
+    @staticmethod
+    def _member_hierarchy_error(ctx, member):
+        guild = ctx.guild
+        bot_member = guild.me if guild else None
+        if guild is None or bot_member is None:
+            return "تعذر التحقق من هرمية الرتب في هذا السيرفر."
+        bot_user_id = getattr(getattr(ctx.bot, "user", None), "id", None)
+        if member.id in (guild.owner_id, bot_user_id):
+            return "لا يمكن تنفيذ هذا الإجراء على مالك السيرفر أو البوت."
+        if member.top_role >= bot_member.top_role:
+            return "رتبة العضو أعلى من رتبة البوت أو مساوية لها."
+        if isinstance(ctx.author, discord.Member):
+            if ctx.author.id != guild.owner_id and member.top_role >= ctx.author.top_role:
+                return "رتبة العضو أعلى من رتبتك أو مساوية لها."
+        return None
+
+    @staticmethod
+    def _role_hierarchy_error(ctx, role):
+        guild = ctx.guild
+        bot_member = guild.me if guild else None
+        if guild is None or bot_member is None or role.is_default() or role.managed:
+            return "لا يمكن تعديل هذه الرتبة."
+        if role >= bot_member.top_role:
+            return "رتبة البوت يجب أن تكون أعلى من الرتبة المستهدفة."
+        if isinstance(ctx.author, discord.Member):
+            if ctx.author.id != guild.owner_id and role >= ctx.author.top_role:
+                return "رتبتك يجب أن تكون أعلى من الرتبة المستهدفة."
+        return None
 
     def _latency_ms(self) -> int:
         """Return a stable value while the Gateway is still connecting."""
@@ -57,11 +187,9 @@ class Control(commands.Cog):
     @app_commands.describe(url="رابط الصورة")
     @need("manage_server")
     async def server_icon(self, ctx, url: str):
-        import aiohttp
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url) as r:
-                data=await r.read()
-        await ctx.guild.edit(icon=data); await self._reply(ctx, "✅ تم تحديث الأيقونة.")
+        data = await self._download_image(url)
+        await ctx.guild.edit(icon=data)
+        await self._reply(ctx, "✅ تم تحديث الأيقونة.")
 
     @server.command(name="verification", description="تغيير مستوى التحقق")
     @app_commands.describe(level="0 none, 1 low, 2 medium, 3 high, 4 highest")
@@ -99,10 +227,9 @@ class Control(commands.Cog):
     @app_commands.describe(url="رابط الصورة")
     @need("manage_server")
     async def server_banner(self, ctx, url: str):
-        import aiohttp
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url) as r: data=await r.read()
-        await ctx.guild.edit(banner=data); await self._reply(ctx,"✅ تم.")
+        data = await self._download_image(url)
+        await ctx.guild.edit(banner=data)
+        await self._reply(ctx,"✅ تم.")
 
     # ---------------- channel ----------------
     @commands.hybrid_group(name="channel", invoke_without_command=True, description="إدارة القنوات")
@@ -116,7 +243,11 @@ class Control(commands.Cog):
     @channel.command(name="delete", description="حذف قناة")
     @app_commands.describe(channel="القناة")
     @need("manage_channels")
-    async def channel_delete(self, ctx, channel: discord.TextChannel): await channel.delete(reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم حذف القناة.")
+    async def channel_delete(self, ctx, channel: discord.TextChannel, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد حذف القناة.", True)
+        await channel.delete(reason=f"Vixen by {ctx.author}")
+        await self._reply(ctx, "✅ تم حذف القناة.")
 
     @channel.command(name="rename", description="إعادة تسمية قناة")
     @app_commands.describe(channel="القناة", name="الاسم")
@@ -141,7 +272,11 @@ class Control(commands.Cog):
     @channel.command(name="purge", description="حذف عدد من الرسائل")
     @app_commands.describe(channel="القناة", amount="1-100")
     @need("manage_messages")
-    async def channel_purge(self, ctx, channel: discord.TextChannel, amount: int): n=await channel.purge(limit=max(1,min(100,amount))); await self._reply(ctx,f"🧹 حُذفت {len(n)} رسالة.",True)
+    async def channel_purge(self, ctx, channel: discord.TextChannel, amount: int, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد حذف الرسائل.", True)
+        deleted = await channel.purge(limit=max(1, min(100, amount)))
+        await self._reply(ctx, f"🧹 حُذفت {len(deleted)} رسالة.", True)
 
     @channel.command(name="lock", description="قفل الكتابة")
     @app_commands.describe(channel="القناة")
@@ -165,19 +300,47 @@ class Control(commands.Cog):
     @member.command(name="timeout", description="تقييد عضو")
     @app_commands.describe(member="العضو", minutes="الدقائق")
     @need("moderate_members")
-    async def member_timeout(self, ctx, member: discord.Member, minutes: int): await member.timeout(discord.utils.utcnow()+__import__('datetime').timedelta(minutes=max(1,min(40320,minutes))),reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"⏳ تم.")
+    async def member_timeout(self, ctx, member: discord.Member, minutes: int):
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        await member.timeout(discord.utils.utcnow() + __import__('datetime').timedelta(minutes=max(1, min(40320, minutes))), reason=f"Vixen by {ctx.author}")
+        logger.info("member_timeout actor=%s target=%s minutes=%s", ctx.author.id, member.id, minutes)
+        await self._reply(ctx, "⏳ تم.")
 
     @member.command(name="untimeout", description="إزالة التقييد")
     @need("moderate_members")
-    async def member_untimeout(self, ctx, member: discord.Member): await member.timeout(None,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
+    async def member_untimeout(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        await member.timeout(None, reason=f"Vixen by {ctx.author}")
+        logger.info("member_untimeout actor=%s target=%s", ctx.author.id, member.id)
+        await self._reply(ctx, "✅ تم.")
 
     @member.command(name="kick", description="طرد عضو")
     @need("kick_members")
-    async def member_kick(self, ctx, member: discord.Member, reason: str="Vixen moderation"): await member.kick(reason=reason); await self._reply(ctx,"👢 تم الطرد.")
+    async def member_kick(self, ctx, member: discord.Member, reason: str="Vixen moderation", confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد الطرد.", True)
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        await member.kick(reason=str(reason)[:512])
+        logger.info("member_kick actor=%s target=%s", ctx.author.id, member.id)
+        await self._reply(ctx, "👢 تم الطرد.")
 
     @member.command(name="ban", description="حظر عضو")
     @need("ban_members")
-    async def member_ban(self, ctx, member: discord.Member, reason: str="Vixen moderation"): await ctx.guild.ban(member,reason=reason,delete_message_seconds=0); await self._reply(ctx,"🔨 تم الحظر.")
+    async def member_ban(self, ctx, member: discord.Member, reason: str="Vixen moderation", confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد الحظر.", True)
+        error = self._member_hierarchy_error(ctx, member)
+        if error:
+            return await self._reply(ctx, f"❌ {error}", True)
+        await ctx.guild.ban(member, reason=str(reason)[:512], delete_message_seconds=0)
+        logger.info("member_ban actor=%s target=%s", ctx.author.id, member.id)
+        await self._reply(ctx, "🔨 تم الحظر.")
 
     @member.command(name="unban", description="فك حظر بواسطة ID")
     @app_commands.describe(user_id="Discord user ID")
@@ -186,24 +349,39 @@ class Control(commands.Cog):
 
     @member.command(name="deafen", description="كتم صوت العضو")
     @need("deafen_members")
-    async def member_deafen(self, ctx, member: discord.Member): await member.edit(deafen=True); await self._reply(ctx,"🔇 تم.")
+    async def member_deafen(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.edit(deafen=True); await self._reply(ctx,"🔇 تم.")
 
     @member.command(name="undeafen", description="إلغاء كتم الصوت")
     @need("deafen_members")
-    async def member_undeafen(self, ctx, member: discord.Member): await member.edit(deafen=False); await self._reply(ctx,"🔊 تم.")
+    async def member_undeafen(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.edit(deafen=False); await self._reply(ctx,"🔊 تم.")
 
     @member.command(name="mute", description="كتم عضو في الصوت")
     @need("mute_members")
-    async def member_mute(self, ctx, member: discord.Member): await member.edit(mute=True); await self._reply(ctx,"🔇 تم.")
+    async def member_mute(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.edit(mute=True); await self._reply(ctx,"🔇 تم.")
 
     @member.command(name="unmute", description="إلغاء كتم الصوت")
     @need("mute_members")
-    async def member_unmute(self, ctx, member: discord.Member): await member.edit(mute=False); await self._reply(ctx,"🔊 تم.")
+    async def member_unmute(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.edit(mute=False); await self._reply(ctx,"🔊 تم.")
 
     @member.command(name="move", description="نقل عضو صوتيًا")
     @app_commands.describe(member="العضو", channel="القناة الصوتية")
     @need("move_members")
-    async def member_move(self, ctx, member: discord.Member, channel: discord.VoiceChannel): await member.move_to(channel); await self._reply(ctx,"✅ تم النقل.")
+    async def member_move(self, ctx, member: discord.Member, channel: discord.VoiceChannel):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.move_to(channel); await self._reply(ctx,"✅ تم النقل.")
 
     @member.command(name="dm", description="إرسال DM لعضو")
     @app_commands.describe(member="العضو", message="الرسالة")
@@ -212,7 +390,10 @@ class Control(commands.Cog):
 
     @member.command(name="disconnect", description="فصل عضو من القناة الصوتية")
     @need("move_members")
-    async def member_disconnect(self, ctx, member: discord.Member): await member.move_to(None); await self._reply(ctx,"✅ تم الفصل.")
+    async def member_disconnect(self, ctx, member: discord.Member):
+        error = self._member_hierarchy_error(ctx, member)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.move_to(None); await self._reply(ctx,"✅ تم الفصل.")
 
     @member.command(name="avatar", description="إرسال رابط صورة عضو")
     @need("view_users")
@@ -230,21 +411,33 @@ class Control(commands.Cog):
     @role.command(name="delete", description="حذف رتبة")
     @app_commands.describe(role="الرتبة")
     @need("manage_roles")
-    async def role_delete(self, ctx, role: discord.Role):
-        if role >= ctx.guild.me.top_role: return await self._reply(ctx,"❌ الرتبة أعلى من رتبة البوت.",True)
+    async def role_delete(self, ctx, role: discord.Role, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد حذف الرتبة.", True)
+        error = self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
         await role.delete(reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
 
     @role.command(name="add", description="إضافة رتبة لعضو")
     @need("manage_roles")
-    async def role_add(self, ctx, member: discord.Member, role: discord.Role): await member.add_roles(role,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
+    async def role_add(self, ctx, member: discord.Member, role: discord.Role):
+        error = self._member_hierarchy_error(ctx, member) or self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.add_roles(role,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
 
     @role.command(name="remove", description="إزالة رتبة من عضو")
     @need("manage_roles")
-    async def role_remove(self, ctx, member: discord.Member, role: discord.Role): await member.remove_roles(role,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
+    async def role_remove(self, ctx, member: discord.Member, role: discord.Role):
+        error = self._member_hierarchy_error(ctx, member) or self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await member.remove_roles(role,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,"✅ تم.")
 
     @role.command(name="rename", description="إعادة تسمية رتبة")
     @need("manage_roles")
-    async def role_rename(self, ctx, role: discord.Role, name: str): await role.edit(name=name); await self._reply(ctx,"✅ تم.")
+    async def role_rename(self, ctx, role: discord.Role, name: str):
+        error = self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await role.edit(name=name[:100]); await self._reply(ctx,"✅ تم.")
 
     @role.command(name="list", description="عرض الرتب")
     @need("view_stats")
@@ -253,12 +446,22 @@ class Control(commands.Cog):
     @role.command(name="color", description="تغيير لون رتبة")
     @app_commands.describe(role="الرتبة", hex_color="مثل #7c5cff")
     @need("manage_roles")
-    async def role_color(self, ctx, role: discord.Role, hex_color: str): await role.edit(color=discord.Color(int(hex_color.strip().lstrip("#"),16))); await self._reply(ctx,"✅ تم.")
+    async def role_color(self, ctx, role: discord.Role, hex_color: str):
+        error = self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        try:
+            color = discord.Color(int(hex_color.strip().lstrip("#"), 16))
+        except (AttributeError, TypeError, ValueError):
+            return await self._reply(ctx, "❌ لون غير صالح.", True)
+        await role.edit(color=color); await self._reply(ctx,"✅ تم.")
 
     @role.command(name="hoist", description="إظهار الرتبة منفصلة")
     @app_commands.describe(role="الرتبة", enabled="تشغيل")
     @need("manage_roles")
-    async def role_hoist(self, ctx, role: discord.Role, enabled: bool): await role.edit(hoist=enabled); await self._reply(ctx,"✅ تم.")
+    async def role_hoist(self, ctx, role: discord.Role, enabled: bool):
+        error = self._role_hierarchy_error(ctx, role)
+        if error: return await self._reply(ctx, f"❌ {error}", True)
+        await role.edit(hoist=enabled); await self._reply(ctx,"✅ تم.")
 
     # ---------------- security ----------------
     @commands.hybrid_group(name="security", invoke_without_command=True, description="الأمان")
@@ -298,7 +501,9 @@ class Control(commands.Cog):
 
     @security.command(name="deletewebhooks", description="حذف كل webhooks")
     @need("manage_server")
-    async def security_deletewebhooks(self, ctx):
+    async def security_deletewebhooks(self, ctx, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد حذف جميع webhooks.", True)
         n=0
         for c in ctx.guild.channels:
             if hasattr(c,'webhooks'):
@@ -333,9 +538,7 @@ class Control(commands.Cog):
     @app_commands.describe(name="الاسم", url="رابط الصورة")
     @need("manage_emojis")
     async def utility_emoji(self, ctx, name: str, url: str):
-        import aiohttp
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url) as r: data=await r.read()
+        data = await self._download_image(url)
         e=await ctx.guild.create_custom_emoji(name=name,image=data,reason=f"Vixen by {ctx.author}"); await self._reply(ctx,f"✅ {e}")
 
     @utility.command(name="sticker", description="عرض معلومات الملصقات")
@@ -358,7 +561,9 @@ class Control(commands.Cog):
     @utility.command(name="prune", description="إزالة أعضاء غير نشطين")
     @app_commands.describe(days="1-30")
     @need("kick_members")
-    async def utility_prune(self, ctx, days: int=7):
+    async def utility_prune(self, ctx, days: int=7, confirm: bool = False):
+        if not confirm:
+            return await self._reply(ctx, "⚠️ أعد الأمر مع confirm=true لتأكيد إزالة الأعضاء غير النشطين.", True)
         days=max(1,min(30,days))
         n=await ctx.guild.prune_members(days=days,dry=False,reason=f"Vixen prune by {ctx.author}")
         await self._reply(ctx,f"✅ تم تنفيذ Prune لمدة {days} يومًا. الأعضاء الذين أزيلوا: {n}")
@@ -386,10 +591,25 @@ class Control(commands.Cog):
         يعلّق الطلب لثوانٍ طويلة على سيرفر فيه عدد كبير من القنوات.
         كل قناة تُحدَّث بمهلة زمنية مستقلة (10 ثوانٍ) — قناة بطيئة أو محظورة
         الوصول لن توقف بقية القنوات ولن تعلّق العملية كاملة."""
-        from bot.utils.data_manager import load_settings, save_settings
-        settings=load_settings(); store=settings.setdefault("lockdown_state",{})
+        async with self._lockdown_lock:
+            await self._apply_lockdown(guild, lock, ctx)
+
+    async def _apply_lockdown(self, guild, lock, ctx):
+        from bot.utils.data_manager import atomic_update_settings, load_settings
+        settings = load_settings()
+        store = settings.get("lockdown_state")
+        if not isinstance(store, dict):
+            store = {}
+            settings["lockdown_state"] = store
         gid=str(guild.id)
         semaphore=asyncio.Semaphore(5)  # يحد التزامن حتى لا يصطدم بـ rate limit دفعة واحدة
+
+        if lock and gid in store:
+            await self._reply(ctx, "🔒 القفل مطبق بالفعل؛ استخدم unlockdown لاستعادة الحالة.", True)
+            return
+        if not lock and gid not in store:
+            await self._reply(ctx, "لا توجد حالة محفوظة لاستعادتها.", True)
+            return
 
         async def _apply(c, send_messages_value):
             async with semaphore:
@@ -407,11 +627,39 @@ class Control(commands.Cog):
                     return str(c.id), None, False
 
         if lock:
+            state = {
+                str(channel.id): {"send_messages": channel.overwrites_for(guild.default_role).send_messages}
+                for channel in guild.text_channels
+            }
+            if not state:
+                await self._reply(ctx, "لا توجد قنوات نصية لقفلها.", True)
+                return
+            persisted = {}
+
+            def save_lockdown_state(current):
+                states = current.get("lockdown_state")
+                if not isinstance(states, dict):
+                    states = {}
+                    current["lockdown_state"] = states
+                if gid in states:
+                    persisted["exists"] = True
+                    return False
+                states[gid] = state
+
+            try:
+                atomic_update_settings(save_lockdown_state)
+            except (OSError, TypeError, ValueError):
+                logger.exception("Could not save lockdown state guild=%s", gid)
+                await self._reply(ctx, "❌ تعذر حفظ حالة القفل؛ لم يتم قفل القنوات.", True)
+                return
+            if persisted.get("exists"):
+                await self._reply(ctx, "🔒 القفل مطبق بالفعل؛ استخدم unlockdown لاستعادة الحالة.", True)
+                return
+
             results = await asyncio.gather(*[_apply(c, False) for c in guild.text_channels])
-            state={cid: {"send_messages": prev} for cid, prev, ok in results if ok}
+            applied = sum(1 for _, _, ok in results if ok)
             skipped = sum(1 for _, _, ok in results if not ok)
-            store[gid]=state; save_settings(settings)
-            msg = f"🔒 Full Lockdown اكتمل ({len(state)} قناة)."
+            msg = f"🔒 Full Lockdown اكتمل ({applied} قناة)."
             if skipped: msg += f" تم تخطي {skipped} قناة فشلت."
             await self._reply(ctx, msg)
         else:
@@ -435,7 +683,25 @@ class Control(commands.Cog):
             results = await asyncio.gather(*[_restore(c) for c in channels])
             restored = sum(1 for ok in results if ok)
             skipped = len(results) - restored
-            store.pop(gid,None); save_settings(settings)
+            remaining = {
+                str(channel.id): state[str(channel.id)]
+                for channel, ok in zip(channels, results)
+                if not ok and str(channel.id) in state
+            }
+            def update_lockdown_state(current):
+                states = current.get("lockdown_state")
+                if not isinstance(states, dict):
+                    current["lockdown_state"] = {}
+                    return
+                if remaining:
+                    states[gid] = remaining
+                else:
+                    states.pop(gid, None)
+
+            try:
+                atomic_update_settings(update_lockdown_state)
+            except (OSError, TypeError, ValueError):
+                logger.exception("Could not save restored lockdown state guild=%s", gid)
             msg = f"🔓 Unlockdown اكتمل ({restored} قناة)."
             if skipped: msg += f" تم تخطي {skipped} قناة فشلت."
             await self._reply(ctx, msg)
